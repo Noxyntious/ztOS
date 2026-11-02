@@ -391,12 +391,15 @@ LEDS = '/sys/class/leds'
 class Lights(Backend):
     """A notification light made of red, green and blue LEDs (names in the
     manifest: rgb = ["red:status", "green:status", "blue:status"]), or a
-    multicolour LED, and a torch."""
+    multicolour LED, or one LED of a single colour (mono = "white:indicator"),
+    and a torch."""
     interface = 'Lights1'
 
     def __init__(self, config, manifest):
         super().__init__(config, manifest)
         self.rgb = config.get('rgb') or self._guess_rgb()
+        # without red, green and blue: one LED, lit at the colour's brightest part
+        self.mono = '' if self.rgb else (config.get('mono') or self._guess_mono())
         self.torch = config.get('torch') or self._guess_torch()
 
     @staticmethod
@@ -410,6 +413,15 @@ class Lights(Backend):
         return pick if len(pick) == 3 else []
 
     @staticmethod
+    def _guess_mono():
+        # LED names are colour:function; these functions are a notification light
+        for function in ('indicator', 'status', 'notification'):
+            found = first(os.path.join(LEDS, '*:' + function))
+            if found:
+                return os.path.basename(found)
+        return ''
+
+    @staticmethod
     def _guess_torch():
         for pattern in ('*:torch', '*:flash', '*torch*', '*flash*'):
             found = first(os.path.join(LEDS, pattern))
@@ -418,24 +430,29 @@ class Lights(Backend):
         return ''
 
     def available(self):
-        return bool(self.rgb or self.torch)
+        return bool(self.rgb or self.mono or self.torch)
 
     def props(self):
         on = read_int(os.path.join(LEDS, self.torch, 'brightness')) > 0 if self.torch else False
-        return {'Lights': ['notification'] if self.rgb else [], 'Torch': on}
+        return {'Lights': ['notification'] if self.rgb or self.mono else [], 'Torch': on}
 
     def m_Set(self, light, colour, on_ms, off_ms):
-        if light != 'notification' or not self.rgb:
+        if light != 'notification' or not (self.rgb or self.mono):
             raise NotSupported(light)
-        for shift, name in zip((16, 8, 0), self.rgb):
+        parts = [(int(colour) >> shift) & 0xff for shift in (16, 8, 0)]
+        leds = zip(self.rgb, parts) if self.rgb else [(self.mono, max(parts))]
+        for name, level in leds:
             base = os.path.join(LEDS, name)
-            level = (int(colour) >> shift) & 0xff
             top = read_int(os.path.join(base, 'max_brightness'), 255)
-            if on_ms and off_ms and level:
-                write(os.path.join(base, 'trigger'), 'timer')
-                write(os.path.join(base, 'delay_on'), int(on_ms))
-                write(os.path.join(base, 'delay_off'), int(off_ms))
-            else:
+            blink = bool(on_ms and off_ms and level)
+            if blink:
+                try:
+                    write(os.path.join(base, 'trigger'), 'timer')
+                    write(os.path.join(base, 'delay_on'), int(on_ms))
+                    write(os.path.join(base, 'delay_off'), int(off_ms))
+                except OSError:
+                    blink = False   # no timer trigger (ledtrig-timer not loaded): a steady light
+            if not blink:
                 write(os.path.join(base, 'trigger'), 'none')
             write(os.path.join(base, 'brightness'), level * top // 255)
 
