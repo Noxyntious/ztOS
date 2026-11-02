@@ -56,6 +56,13 @@ def read_int(path, default=0):
         return default
 
 
+def selected(text):
+    """The chosen one of a sysfs list, marked "[...]" ("Unknown [SDP] DCP CDP"
+    is SDP); the text itself when nothing is marked."""
+    start, end = text.find('['), text.find(']')
+    return text[start + 1:end] if 0 <= start < end else text
+
+
 def write(path, value):
     with open(path, 'w') as stream:
         stream.write(str(value))

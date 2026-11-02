@@ -12,7 +12,7 @@ import pathlib
 import struct
 import time
 
-from . import Backend, NotSupported, exists, first, read, read_int, write
+from . import Backend, NotSupported, exists, first, read, read_int, selected, write
 
 SUPPLY = '/sys/class/power_supply'
 
@@ -62,7 +62,7 @@ class Power(Backend):
             'VoltageNow': read_int(self.node('voltage_now')) if b else 0,
             'Temperature': read_int(self.node('temp')) / 10.0 if b else 0.0,
             'ChargerOnline': online,
-            'ChargerType': (read(self.node('usb_type', self.charger)) or read(self.node('type', self.charger)) or '')
+            'ChargerType': selected(read(self.node('usb_type', self.charger)) or read(self.node('type', self.charger)) or '')
             if self.charger else '',
             'InputCurrentLimit': read_int(limit, -1) if exists(limit) else -1,
             'ChargeLimit': read_int(end, 100) if exists(end) else 100,
