@@ -62,7 +62,7 @@ Clone each of these repos into the same folder, next to each other, and set thei
 | [Noxyntious/ztOS](https://github.com/Noxyntious/ztOS/tree/port/xiaomi-daisy) | `port/xiaomi-daisy` |
 | [postmarketOS/pmaports](https://gitlab.postmarketos.org/postmarketOS/pmaports) | (the kernel, firmware and lk2nd) |
 
-ztConflo (essentially pmbootstrap but for ztOS) runs on Arch Linux ONLY, to use any other distro you need to use distrobox. 
+ztConflo (essentially pmbootstrap but for ztOS) runs on Arch Linux and derivatives (Cachy, Endeavour, Omarchy, Manjaro, Nyarch etc.) ONLY, to use any other distro you need to use distrobox. 
 
 Make sure you are using a rootful distrobox!!! (--root)
 
@@ -71,6 +71,7 @@ ONLY building is done in distrobox, flashing is done outside.
 ```
 distrobox create --root -n ztos-arch-root -i docker.io/library/archlinux:latest -Y
 distrobox enter --root ztos-arch-root
+sudo pacman -Syu python git
 ```
 
 Now, in the ztConflo folder:
@@ -157,7 +158,7 @@ To disable SIM pins, add --disable-pin to the end: `sudo mmcli -i any --pin=1234
 
 ### SSH over USB
 
-When the phone is connected to USB, RNDIS kicks in and gives you network access:
+When the phone is connected to USB, NCM kicks in and gives you network access:
 
 ```
 ssh alarm@172.16.42.1
