@@ -12581,9 +12581,12 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 		wlr_log(WLR_INFO, "nav: key %u %s", event->keycode,
 			event->state == WL_KEYBOARD_KEY_STATE_PRESSED ? "down" : "up");
 		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-			/* the two touch keys answer every touch, locked or not: home
-			 * is a button that clicks by itself */
-			if (nav != NAV_START) {
+			/* the touch keys answer every touch, locked or not: Samsung's
+			 * home is a button that clicks by itself, but a home key in the
+			 * touchscreen (ztos-virtualkeyd's "ztOS virtual keys") is a
+			 * touch key like the others */
+			const char *from = keyboard->wlr_keyboard->base.name;
+			if (nav != NAV_START || (from && strstr(from, "ztOS virtual keys"))) {
 				hap(server, HAP_TAP, HG_NAV);
 			}
 			if (server->locked || server->auth_active) {
