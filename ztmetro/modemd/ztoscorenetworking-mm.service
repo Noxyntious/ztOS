@@ -1,0 +1,14 @@
+[Unit]
+Description=Modem state for the shell, calls and SMS, over ModemManager (ztoscorenetworkingd's protocol)
+After=ModemManager.service NetworkManager.service
+Wants=ModemManager.service
+# the S9's daemon speaks the same protocol to its own modem: one or the other
+Conflicts=ztoscorenetworking.service
+
+[Service]
+ExecStart=/usr/local/sbin/ztoscorenetworkingd-mm
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target

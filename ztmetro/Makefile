@@ -236,6 +236,8 @@ install: check-arch
 	install -Dm755 modemd/ztoscorenetworkingd /usr/local/sbin/ztoscorenetworkingd
 	install -Dm644 modemd/ztoscorenetworking-modem.service /etc/systemd/system/ztoscorenetworking-modem.service
 	install -Dm644 modemd/ztoscorenetworking.service /etc/systemd/system/ztoscorenetworking.service
+	install -Dm755 modemd/ztoscorenetworkingd-mm /usr/local/sbin/ztoscorenetworkingd-mm
+	install -Dm644 modemd/ztoscorenetworking-mm.service /etc/systemd/system/ztoscorenetworking-mm.service
 	install -Dm755 csf/ztoscsf /usr/local/sbin/ztoscsf
 	install -Dm755 notifyd/ztnotifyd /usr/local/bin/ztnotifyd
 	install -Dm755 phone/ztphone /usr/local/bin/ztphone
