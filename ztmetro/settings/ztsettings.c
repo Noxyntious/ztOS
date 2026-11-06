@@ -403,6 +403,16 @@ static void cluster(const char *policy, char *cores, size_t size, int *min_mhz, 
 	*max_mhz = buf[0] ? atoi(buf) / 1000 : little ? 1794 : 2704;
 }
 
+/* the memory Linux has, as the S9's "3.5 GB" was (its 4 GB less what the
+ * firmware keeps), from sysinfo */
+static double ram_gb(void) {
+	struct sysinfo si;
+	if (sysinfo(&si) != 0 || si.totalram == 0) {
+		return 3.5;
+	}
+	return (double)si.totalram * si.mem_unit / (1024.0 * 1024 * 1024);
+}
+
 /* the GPU by its device tree name: "qcom,adreno-615.0" is "Adreno 615" */
 static const char *gpu_name(void) {
 	static char name[48];
@@ -1089,7 +1099,7 @@ static double draw_main(cairo_t *cr) {
 	snprintf(detail, sizeof(detail), "%s (%ld cores), %s", soc_name(), sysconf(_SC_NPROCESSORS_CONF), app.cpu_gov);
 	y = zmc_entry(cr, y, "processor", detail, ACT_OPEN_PAGE, PAGE_CPU);
 
-	snprintf(detail, sizeof(detail), "3.5 GB RAM, swappiness %d", app.swappiness);
+	snprintf(detail, sizeof(detail), "%.1f GB RAM, swappiness %d", ram_gb(), app.swappiness);
 	y = zmc_entry(cr, y, "virtual memory", detail, ACT_OPEN_PAGE, PAGE_VM);
 
 	snprintf(detail, sizeof(detail), "%s (%s), 60 FPS", gpu_name(), app.gpu_gov);
