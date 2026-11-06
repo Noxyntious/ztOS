@@ -3,7 +3,25 @@
 # (the phone is 172.16.42.1 and hands the host 172.16.42.2) and an ACM serial
 # port with a getty on ttyGS0.
 g=/sys/kernel/config/usb_gadget/zboot
-[ -d "$g" ] && exit 0
+[ -d "$g" ] && [ -n "$(cat "$g/UDC" 2>/dev/null)" ] && exit 0
+
+# A gadget is torn down from the inside out: unbound, its configs' links,
+# configs, functions and strings, then itself
+release() {
+	echo "" > "$1/UDC" 2>/dev/null || true
+	for l in "$1"/configs/*/*; do [ -L "$l" ] && rm -f "$l"; done
+	for d in "$1"/configs/*/strings/* "$1"/configs/* "$1"/functions/* "$1"/strings/*; do
+		[ -d "$d" ] && rmdir "$d" 2>/dev/null
+	done
+	rmdir "$1" 2>/dev/null || true
+}
+# the controller is the phone's only one: a gadget left from the boot (a
+# postmarketOS initramfs's g1) holds it, and one of ours that came out half
+# made goes too, so this one can be whole
+for other in /sys/kernel/config/usb_gadget/*; do
+	[ -d "$other" ] && release "$other"
+done
+
 udc=$(ls /sys/class/udc 2>/dev/null | head -n1)
 [ -n "$udc" ] || { echo "no UDC" >&2; exit 1; }
 mkdir -p "$g/strings/0x409" "$g/configs/c.1/strings/0x409" \
@@ -11,8 +29,8 @@ mkdir -p "$g/strings/0x409" "$g/configs/c.1/strings/0x409" \
 echo 0x1d6b > "$g/idVendor"
 echo 0x0104 > "$g/idProduct"
 echo "zboot" > "$g/strings/0x409/manufacturer"
-echo "Galaxy S9 Arch Linux ARM" > "$g/strings/0x409/product"
-echo "starlte" > "$g/strings/0x409/serialnumber"
+echo "ztOS" > "$g/strings/0x409/product"
+echo "$(cat /etc/hostname 2>/dev/null || echo ztos)" > "$g/strings/0x409/serialnumber"
 echo "ncm+acm" > "$g/configs/c.1/strings/0x409/configuration"
 echo 02:5a:42:00:00:01 > "$g/functions/ncm.usb0/dev_addr"
 echo 02:5a:42:00:00:02 > "$g/functions/ncm.usb0/host_addr"
