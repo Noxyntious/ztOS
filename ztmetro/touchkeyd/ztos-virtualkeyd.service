@@ -1,0 +1,15 @@
+[Unit]
+Description=Capacitive keys that are part of the touchscreen (ztos-virtualkeyd)
+# a phone with keys in its touchscreen names them here
+ConditionPathExists=/etc/ztos/virtualkeys.conf
+After=systemd-udev-settle.service
+# ztMETRO looks for the phone's own keys as it starts
+Before=greetd.service
+
+[Service]
+ExecStart=/usr/local/sbin/ztos-virtualkeyd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
