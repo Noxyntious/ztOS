@@ -592,7 +592,11 @@ static double draw_page_sleep(cairo_t *cr) {
 		snprintf(chg_buf, sizeof(chg_buf), "Disconnected (running on battery)");
 	y = zmc_field(cr, y, "Power supply", chg_buf);
 
-	y = zmc_field(cr, y, "Power IC hardware", "Maxim MAX17055 Fuel Gauge • MAX77705 PMIC");
+	/* the drivers behind the battery and charger: max170xx_battery and
+	 * max77705-charger on the S9, the phone's own elsewhere */
+	char ic_buf[160];
+	snprintf(ic_buf, sizeof(ic_buf), "%s • %s", strrchr(hw_battery(), '/') + 1, strrchr(hw_charger(), '/') + 1);
+	y = zmc_field(cr, y, "Power IC hardware", ic_buf);
 	y += 16;
 
 	// Action buttons

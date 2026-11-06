@@ -309,11 +309,11 @@ static bool check_part(size_t index) {
 
 static double draw_hardware(cairo_t *cr) {
 	static const struct { const char *what, *missing; } parts[] = {
-		{ "Display (DECON, DSI)", "no panel" },
-		{ "GPU (Mali-G72, Panfrost)", "no GPU" },
-		{ "Touch (s6sy761)", "no touch" },
-		{ "Wi-Fi (brcmfmac)", "no Wi-Fi interface" },
-		{ "Battery gauge (MAX77705)", "no gauge" },
+		{ "Display", "no panel" },
+		{ "GPU", "no GPU" },
+		{ "Touch", "no touch" },
+		{ "Wi-Fi", "no Wi-Fi interface" },
+		{ "Battery gauge", "no gauge" },
 		{ "Sound card", "none: no codec or audio DSP driver" },
 		{ "Backlight device", "none: brightness is done by the shell" },
 		{ "Light and motion sensors", "none: no sensor hub driver" },
