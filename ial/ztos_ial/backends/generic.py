@@ -9,6 +9,8 @@ import fcntl
 import json
 import os
 import pathlib
+import re
+import select
 import struct
 import time
 
@@ -266,6 +268,66 @@ class Sleep(Backend):
 IIO = '/sys/bus/iio/devices'
 
 
+# IIO's scan element type: "le:s16/16>>0" (endianness, sign, bits used,
+# bits stored, shift)
+IIO_TYPE = re.compile(r'([bl])e:([su])(\d+)/(\d+)(?:X(\d+))?>>(\d+)')
+
+
+def buffered_sample(device, channels, timeout_ms=1500):
+    """One sample of these channels (scan element names, "in_accel_x"...) from
+    a sensor that only streams (no *_raw files: the ones a DSP serves, such
+    as qcom-smgr's): the stream on for as long as one record takes, then off.
+    Values in channel order, unscaled."""
+    scan = device / 'scan_elements'
+    buf = device / 'buffer' if (device / 'buffer' / 'enable').exists() else device / 'buffer0'
+    write(buf / 'enable', 0)
+    # a DSP sensor at rate 0 is not sampled at all (qcom-smgr's proximity)
+    for rate in device.glob('in_*_sampling_frequency'):
+        if (read(rate, '0') or '0').split('.')[0] in ('', '0'):
+            try:
+                write(rate, 10)
+            except OSError:
+                pass
+    for en in scan.glob('*_en'):
+        write(en, 1 if en.name[:-3] in channels else 0)
+    layout = []         # (index, name, struct format, bytes, bits, shift, signed)
+    for name in channels:
+        m = IIO_TYPE.match(read(scan / f'{name}_type') or '')
+        if not m:
+            raise NotSupported(f'{device.name}: {name} has no type')
+        endian, sign, bits, storage, _repeat, shift = m.groups()
+        size = int(storage) // 8
+        fmt = ('<' if endian == 'l' else '>') + {1: 'B', 2: 'H', 4: 'I', 8: 'Q'}[size]
+        layout.append((read_int(scan / f'{name}_index'), name, fmt, size, int(bits), int(shift), sign == 's'))
+    layout.sort()
+    record, offsets = 0, []
+    for _index, _name, _fmt, size, *_ in layout:
+        record = -(-record // size) * size      # each element aligned to its own size
+        offsets.append(record)
+        record += size
+    write(buf / 'length', 2)
+    write(buf / 'enable', 1)
+    try:
+        fd = os.open(f'/dev/{device.name}', os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            poller = select.poll()
+            poller.register(fd, select.POLLIN)
+            if not poller.poll(timeout_ms):
+                raise NotSupported(f'{device.name}: no sample within {timeout_ms} ms')
+            data = os.read(fd, record)
+        finally:
+            os.close(fd)
+    finally:
+        write(buf / 'enable', 0)
+    values = {}
+    for (_index, name, fmt, size, bits, shift, signed), at in zip(layout, offsets):
+        raw = (struct.unpack(fmt, data[at:at + size])[0] >> shift) & ((1 << bits) - 1)
+        if signed and raw & (1 << (bits - 1)):
+            raw -= 1 << bits
+        values[name] = raw
+    return [values[name] for name in channels]
+
+
 class Sensors(Backend):
     interface = 'Sensors1'
 
@@ -273,6 +335,9 @@ class Sensors(Backend):
         found = {}
         for device in sorted(pathlib.Path(IIO).glob('iio:device*')):
             names = {p.name for p in device.iterdir()}
+            # a sensor that only streams has its channels as scan elements
+            if 'scan_elements' in names:
+                names |= {p.name[:-3] + '_raw' for p in (device / 'scan_elements').glob('in_*_en')}
             if any(n.startswith('in_illuminance') for n in names):
                 found.setdefault('light', device)
             if {'in_accel_x_raw', 'in_accel_y_raw', 'in_accel_z_raw'} <= names:
@@ -301,8 +366,19 @@ class Sensors(Backend):
         axis = {'accelerometer': 'accel', 'magnetometer': 'magn'}.get(sensor)
         if axis:
             scale = float(read(device / f'in_{axis}_scale', '1') or 1)
+            if not (device / f'in_{axis}_x_raw').exists():
+                return [v * scale for v in buffered_sample(device, [f'in_{axis}_{a}' for a in 'xyz'])]
             return [read_int(device / f'in_{axis}_{a}_raw') * scale for a in 'xyz']
         if sensor == 'proximity':
+            if not (device / 'in_proximity_raw').exists():
+                raw = buffered_sample(device, ['in_proximity'])[0]
+                scale = float(read(device / 'in_proximity_scale', '1') or 1)
+                if scale < 0:
+                    # qcom-smgr: raw is (65536 - d)/65536 of the range, and
+                    # the offset is the range in metres: 65536 is touching
+                    reach = float(read(device / 'in_proximity_offset', '0') or 0)
+                    return [round(100 * reach * (1 - raw / 65536), 2)]
+                return [float(raw)]
             return [float(read_int(device / 'in_proximity_raw'))]
         raise NotSupported(sensor)
 
