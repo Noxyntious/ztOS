@@ -1,5 +1,6 @@
 # ztOS for Mi A2 Lite (daisy), Redmi 3S (land), Poco F1 (beryllium)
 
+# Main is not updated, [click here](https://github.com/Noxyntious/ztOS/tree/port/xiaomi-daisy)
 
 | Phone | Codename | SoC | ztOS branch | Device entry (ztos-devices) | Status |
 |---|---|---|---|---|---|
