@@ -13,30 +13,30 @@
 | | SD card | ❔ Untested | |
 | | Battery | ✅ Works | Level, voltage and charging |
 | | Suspend and resume | ✅ Works | Sleep and wake with the power key |
-| **Display** | Screen | ✅ Works | 1080×2280 DSI |
+| **Display** | Screen | ✅ Works | 720×1280 EBBG, capacitive keys |
 | | Backlight | ✅ Works | Through ztOSIAL |
-| | Touchscreen | ✅ Works | Goodix |
-| **Multimedia** | 3D acceleration | ✅ Works | freedreno, Adreno 506, OpenGL ES 3.1 |
+| | Touchscreen | ✅ Works | FocalTech FT5306 |
+| **Multimedia** | 3D acceleration | ✅ Works | freedreno, Adreno 505 |
 | | Audio: speaker | ✅ Works | |
-| | Audio: earpiece and microphone | ✅ Works | Calls, via q6voiced |
+| | Audio: earpiece and microphone | ✅ Works | |
 | | Audio: headphones | ❔ Untested | |
-| | Camera | ❌ Broken | ov5675 sensor fails to probe |
-| | Camera flash / flashlight | ❔ Untested | |
-| **Connectivity** | Wi-Fi | ✅ Works | 2.4 and 5 GHz, remembered across reboots |
-| | Bluetooth | ⚠️ Partial | Controller comes up; pairing untested |
-| | GPS | ❌ Not working | Not started |
+| | Camera | ❌ Broken | |
+| | Camera flash / flashlight | ✅ Works | |
+| **Connectivity** | Wi-Fi | ✅ Works | 2.4 GHz only (no 5ghz support on land) |
+| | Bluetooth | ⚠️ Partial | Works with headsets |
+| | GPS | ✅ Works | Through modem, takes a while |
 | | NFC | ➖ N/A | The phone has none |
 | **Modem** | SIM | ✅ Works | Logs on to network |
 | | Calls | ❌ Broken | No sound |
-| | SMS | ❌ Broken | |
-| | Mobile data | ❔ Untested | |
+| | SMS | ❔ Untested | |
+| | Mobile data | ✅ Works | |
 | **Sensors** | Accelerometer | ✅ Works | |
 | | Gyroscope | ✅ Works | |
-| | Ambient light | ✅ Works | |
-| | Proximity | ❔ Untested | |
-| | Magnetometer | ❔ Untested | |
+| | Ambient light | ➖ N/A | No sensor |
+| | Proximity | ✅ Works | |
+| | Magnetometer | ❌ Broken | Reads 0 |
 | | Haptics | ✅ Works | |
-| **Miscellaneous** | Notification LED | ✅ Works | Single colour, blinks |
+| **Miscellaneous** | Notification LED | ✅ Works | all RGB works |
 | | USB OTG | ❔ Untested | |
 | | ztOSIAL (`ztos-ial test`) | ✅ Works | All interfaces pass |
 | | Android apps (Waydroid) | ❌ Broken | Kernel lacks `CONFIG_ANDROID_BINDERFS` |
@@ -58,7 +58,7 @@ Clone each of these repos into the same folder, next to each other, and set thei
 | Repository | Branch |
 |---|---|
 | [Noxyntious/ztconflo](https://github.com/Noxyntious/ztconflo/tree/port/xiaomi-daisy) | `port/xiaomi-daisy` |
-| [Noxyntious/ztos-devices](https://github.com/Noxyntious/ztos-devices/tree/port/xiaomi-daisy) | `port/xiaomi-land` |
+| [Noxyntious/ztos-devices](https://github.com/Noxyntious/ztos-devices/tree/port/xiaomi-land) | `port/xiaomi-land` |
 | [Noxyntious/ztOS](https://github.com/Noxyntious/ztOS/tree/port/xiaomi-daisy) | `port/xiaomi-daisy` |
 | [postmarketOS/pmaports](https://gitlab.postmarketos.org/postmarketOS/pmaports) | (the kernel, firmware and lk2nd) |
 
@@ -77,11 +77,11 @@ sudo pacman -Syu python git
 Now, in the ztConflo folder:
 
 ```
-python -m ztconflo build xiaomi-daisy \
+python -m ztconflo build xiaomi-land \
     --registry ../ztos-devices --pmaports ../pmaports --ztos-src ../ztOS --jobs 16
 ```
 
-If everything goes well, you should hopefully have your images in `out/xiaomi-daisy/`.
+If everything goes well, you should hopefully have your images in `out/xiaomi-land/`.
 
 If you run into "No such file or directory" errors, QEMU might have lost its F flag. `grep flags /proc/sys/fs/binfmt_misc/qemu-aarch64`
 
@@ -100,7 +100,7 @@ sudo systemctl restart systemd-binfmt
 
 ## Step 2: Flash lk2nd
 
-Make sure you are in the xiaomi-daisy folder:
+Make sure you are in the xiaomi-land folder:
 
 ```
 cd out/xiaomi-land
