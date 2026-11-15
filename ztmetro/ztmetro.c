@@ -685,7 +685,8 @@ struct zt_server {
 	struct wl_event_source *volume_timer;
 	/* Power + Volume down: a screenshot. Power waits a moment (shot_timer) for
 	 * volume down before it turns the screen off */
-	struct wl_event_source *shot_timer, *shot_note_timer, *shot_grab_timer;
+	struct wl_event_source *shot_timer, *shot_note_timer, *shot_grab_timer, *shot_pump_timer;
+	uint32_t shot_pump_until;
 	bool power_pending, vol_down_held;
 	char shot_path[256];
 	struct wl_event_source *volume_repeat_timer, *volume_pip_timer;
@@ -10301,11 +10302,25 @@ static void uninstall_item(struct zt_server *server, int index) {
 static void screen_set(struct zt_server *server, bool on);
 static void activity(struct zt_server *server);
 
+/* screencopy gives grim the next frame drawn, and an idle screen draws none:
+ * grim then took whatever came next (the volume panel, its own notice). Frames
+ * are drawn for a moment, so the next one is the screen as it is. */
+static int screenshot_pump(void *data) {
+	struct zt_server *server = data;
+	damage(server);
+	if ((int32_t)(server->shot_pump_until - now_ms()) > 0) {
+		wl_event_source_timer_update(server->shot_pump_timer, 16);
+	}
+	return 0;
+}
+
 /* The capture itself, once the screen shows what is to be kept. */
 static int screenshot_grab(void *data) {
 	struct zt_server *server = data;
 	run_detached("sh", "-c", "mkdir -p \"$(dirname \"$0\")\" && exec grim \"$0\"", server->shot_path);
-	wl_event_source_timer_update(server->shot_note_timer, 600);
+	server->shot_pump_until = now_ms() + 400;
+	screenshot_pump(server);
+	wl_event_source_timer_update(server->shot_note_timer, 900);
 	wlr_log(WLR_INFO, "screenshot: %s", server->shot_path);
 	return 0;
 }
@@ -14661,6 +14676,7 @@ int main(int argc, char *argv[]) {
 	server.shot_timer = wl_event_loop_add_timer(server.loop, power_alone, &server);
 	server.shot_note_timer = wl_event_loop_add_timer(server.loop, screenshot_noted, &server);
 	server.shot_grab_timer = wl_event_loop_add_timer(server.loop, screenshot_grab, &server);
+	server.shot_pump_timer = wl_event_loop_add_timer(server.loop, screenshot_pump, &server);
 	server.volume_repeat_timer = wl_event_loop_add_timer(server.loop, volume_repeat, &server);
 	server.volume_pip_timer = wl_event_loop_add_timer(server.loop, volume_pip, &server);
 	server.peek_timer = wl_event_loop_add_timer(server.loop, peek_timed_out, &server);
