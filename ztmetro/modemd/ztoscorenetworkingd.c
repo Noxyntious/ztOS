@@ -2196,7 +2196,8 @@ static void wifi_read(void)
 
 	/* 4. sysfs link carrier or operstate */
 	if (bars < 0) {
-		p = popen("for d in /sys/class/net/w*; do "
+		/* only wireless interfaces: waydroid0 (Waydroid's bridge) is always up */
+		p = popen("for d in /sys/class/net/*; do [ -e $d/wireless ] || [ -e $d/phy80211 ] || continue; "
 			"[ \"$(cat $d/carrier 2>/dev/null)\" = 1 ] && echo up && break; "
 			"[ \"$(cat $d/operstate 2>/dev/null)\" = up ] && echo up && break; done", "r");
 		if (p) {

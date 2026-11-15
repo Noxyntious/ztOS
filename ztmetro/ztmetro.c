@@ -5114,12 +5114,24 @@ static int read_battery(void) {
 	return capacity;
 }
 
+/* A Wi-Fi interface: one the kernel calls wireless. Not every name with a w is
+ * one (waydroid0, Waydroid's bridge, is always up). */
+static bool net_wireless(const char *name) {
+	char path[300];
+	snprintf(path, sizeof(path), "/sys/class/net/%s/wireless", name);
+	if (access(path, F_OK) == 0) {
+		return true;
+	}
+	snprintf(path, sizeof(path), "/sys/class/net/%s/phy80211", name);
+	return access(path, F_OK) == 0;
+}
+
 static bool wifi_up(void) {
 	DIR *dir = opendir("/sys/class/net");
 	struct dirent *entry;
 	bool up = false;
 	while (dir && !up && (entry = readdir(dir))) {
-		if (entry->d_name[0] != 'w') {
+		if (entry->d_name[0] == '.' || !net_wireless(entry->d_name)) {
 			continue;
 		}
 		char path[300], state[16] = "";
@@ -6116,7 +6128,7 @@ static int net_tick(void *data) {
 		DIR *dir = opendir("/sys/class/net");
 		struct dirent *entry;
 		while (dir && (entry = readdir(dir))) {
-			if (entry->d_name[0] == 'w') {
+			if (entry->d_name[0] != '.' && net_wireless(entry->d_name)) {
 				snprintf(name, sizeof(name), "%s", entry->d_name);
 			}
 		}
