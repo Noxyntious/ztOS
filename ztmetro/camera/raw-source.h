@@ -10,6 +10,8 @@
  * Numbers from Samsung's stock firmware (see camera/README.md): black 64 and white
  * 1023 (libexynoscamera3.so), sensor orientation rear 90, front 270 (the same), rear
  * colour from its forward matrices; front colour from a matrix in setfile_3h1.bin.
+ * Two drivers give such frames: zrn-cam (the S9's, 16-bit) and Qualcomm's CAMSS
+ * (camss-source.h: sdm845, 10-bit MIPI-packed, unpacked by the same shaders).
  * Included by ztcamera.c, inside its GL frame.
  */
 #include <EGL/egl.h>
@@ -67,6 +69,11 @@ static struct {
 	enum af_state af;
 	double af_low_since, af_asked;
 	bool ae_settled;
+	/* which driver; the frame's layout: red's place in the 2x2 cell, MIPI packing */
+	enum { RAW_ZRN, RAW_CAMSS } backend;
+	int first[2];
+	bool packed;
+	int u_packed, u_tw;
 } raw = { .fd = -1, .dmabuf = -1, .gain = { 1, 1, 1 }, .coarse = 8000, .again = 64 };
 
 static const char *const raw_stop_why[] = { "running", "stopped", "idle", "time limit",
@@ -99,7 +106,16 @@ static void raw_images_free(void) {
 	}
 }
 
+#include "camss-source.h"
+
 static void raw_close(void) {
+	if (raw.backend == RAW_CAMSS) {
+		cs_close();
+		raw.fd = -1;
+		raw.packed = false;
+		raw.backend = RAW_ZRN;
+		return;
+	}
 	raw_images_free();
 	if (raw.map) {
 		munmap(raw.map, RAW_POOL);
@@ -116,7 +132,47 @@ static void raw_close(void) {
 }
 
 static bool raw_say(const char *cmd) {
+	if (raw.backend == RAW_CAMSS) {
+		return raw.fd >= 0 && cs_say(cmd);
+	}
 	return raw.fd >= 0 && write(raw.fd, cmd, strlen(cmd)) == (ssize_t)strlen(cmd);
+}
+
+/* The newest frame's description, from either driver. */
+static bool raw_read_info(void) {
+	if (raw.backend == RAW_CAMSS) {
+		return raw.fd >= 0 && cs_next();
+	}
+	return raw.fd >= 0 && read(raw.fd, &raw.info, sizeof(raw.info)) == sizeof(raw.info);
+}
+
+/* Whether either driver has a camera here (CAMSS is asked once, then remembered). */
+static bool raw_available(void) {
+	return access(RAW_DEV, F_OK) == 0 || cs_probe();
+}
+
+/* Buffer i's pixels in memory. */
+static const uint8_t *raw_base(unsigned i) {
+	if (raw.backend == RAW_CAMSS) {
+		return i < RAW_BUFS ? (const uint8_t *)cs.map[i] : NULL;
+	}
+	return (const uint8_t *)raw.map + i * (size_t)raw.info.area;
+}
+
+/* One pixel of a row: 16-bit, or MIPI 10-bit packed (four in five bytes). */
+static inline int raw_px(const uint8_t *row, int x) {
+	if (raw.packed) {
+		const uint8_t *g = row + (x >> 2) * 5;
+		int i = x & 3;
+		return g[i] << 2 | (g[4] >> (2 * i) & 3);
+	}
+	return ((const uint16_t *)row)[x];
+}
+
+/* Where each colour sits in the 2x2 cell: red at (rx, ry), blue opposite, greens between. */
+static void raw_cell(int *rx, int *ry) {
+	*rx = raw.first[0];
+	*ry = raw.first[1];
 }
 
 static void raw_set_exposure(int c, int g) {
@@ -158,6 +214,26 @@ static bool raw_open(enum raw_cam cam) {
 	if (cam == RAW_IR) {
 		return false;
 	}
+	if (access(RAW_DEV, F_OK) != 0) {
+		if (cam != RAW_REAR || !cs_open()) {
+			return false;
+		}
+		raw.backend = RAW_CAMSS;
+		raw.fd = cs.vid;
+		raw.coarse = raw.coarse_max / 2;
+		raw.again = 64;
+		raw.wb_set = false;
+		raw.gain[0] = raw.gain[1] = raw.gain[2] = 1;
+		memcpy(raw.ccm, rear_fm_d, sizeof(raw.ccm));	/* no IMX363 matrix yet: the S9's daylight one */
+		raw_set_exposure(raw.coarse, raw.again);
+		raw_focus_start();
+		if (cs.lens < 0) {
+			raw.af = AF_IDLE;
+		}
+		return true;
+	}
+	raw.backend = RAW_ZRN;
+	raw.packed = false;
 	raw.fd = open(RAW_DEV, O_RDWR | O_CLOEXEC);
 	if (raw.fd < 0) {
 		return false;
@@ -172,10 +248,13 @@ static bool raw_open(enum raw_cam cam) {
 		raw_close();
 		return false;
 	}
-	if (read(raw.fd, &raw.info, sizeof(raw.info)) != sizeof(raw.info) || !raw.info.w) {
+	if (!raw_read_info() || !raw.info.w) {
 		raw_close();
 		return false;
 	}
+	/* rear GB/RG: red at x 0, y 1. Front GR/BG: red at x 1, y 0. */
+	raw.first[0] = raw.info.bayer ? 1 : 0;
+	raw.first[1] = raw.info.bayer ? 0 : 1;
 	raw.dmabuf = ioctl(raw.fd, RAW_DMABUF);
 	if (raw.dmabuf < 0) {
 		fprintf(stderr, "ztcamera: no DMA-BUF (%s), the frames will be copied\n", strerror(errno));
@@ -221,15 +300,15 @@ static void raw_expose(double green, double clipped) {
 
 /* A thin grid across the frame, centre counted twice. */
 static void raw_stats(const uint8_t *base) {
-	int w = raw.info.w, h = raw.info.h, st = raw.info.stride;
+	int w = raw.info.w, h = raw.info.h, st = raw.info.stride, rx, ry;
+	raw_cell(&rx, &ry);
 	double sum[3] = { 0, 0, 0 }, n = 0, seen = 0, clip = 0;
 	for (int y = h / 64 & ~1; y < h - 1; y += h / 32 & ~1) {
-		const uint16_t *a = (const uint16_t *)(base + (size_t)y * st);
-		const uint16_t *b = (const uint16_t *)(base + (size_t)(y + 1) * st);
+		const uint8_t *row[2] = { base + (size_t)y * st, base + (size_t)(y + 1) * st };
 		bool ymid = y > h / 4 && y < h * 3 / 4;
 		for (int x = w / 64 & ~1; x < w - 1; x += w / 32 & ~1) {
-			int g1 = a[x], one = a[x + 1], other = b[x], g2 = b[x + 1];
-			int r = raw.info.bayer ? one : other, bl = raw.info.bayer ? other : one;
+			int r = raw_px(row[ry], x + rx), bl = raw_px(row[1 - ry], x + 1 - rx);
+			int g1 = raw_px(row[ry], x + 1 - rx), g2 = raw_px(row[1 - ry], x + rx);
 			double wt = ymid && x > w / 4 && x < w * 3 / 4 ? 2 : 1;
 			seen += wt;
 			if (g1 >= 990 || g2 >= 990 || r >= 990 || bl >= 990) {
@@ -270,14 +349,16 @@ static void raw_stats(const uint8_t *base) {
 
 /* Green differences in the middle of the frame, over its brightness. */
 static double raw_sharpness(const uint8_t *base) {
-	int w = raw.info.w, h = raw.info.h, st = raw.info.stride;
+	int w = raw.info.w, h = raw.info.h, st = raw.info.stride, rx, ry;
+	raw_cell(&rx, &ry);
+	int gx = ry == 0 ? 1 - rx : rx;	/* green's column on an even row */
 	double d = 0, s = 1;
 	for (int y = (h * 3 / 8) & ~1; y < h * 5 / 8; y += 8) {
-		const uint16_t *a = (const uint16_t *)(base + (size_t)y * st);
-		for (int x = (w * 3 / 8) & ~1; x < w * 5 / 8; x += 8) {
+		const uint8_t *a = base + (size_t)y * st;
+		for (int x = ((w * 3 / 8) & ~1) + gx; x < w * 5 / 8; x += 8) {
 			/* pairs of green pixels against the next pair: less noise than one against one */
-			int v = (int)a[x] + a[x + 2] - 2 * RAW_BLACK, u = (int)a[x + 4] + a[x + 6] - 2 * RAW_BLACK;
-			int m = (int)a[x + 8] + a[x + 10] - 2 * RAW_BLACK;
+			int v = raw_px(a, x) + raw_px(a, x + 2) - 2 * RAW_BLACK, u = raw_px(a, x + 4) + raw_px(a, x + 6) - 2 * RAW_BLACK;
+			int m = raw_px(a, x + 8) + raw_px(a, x + 10) - 2 * RAW_BLACK;
 			d += (v - u) * (v - u) + (u - m) * (u - m);
 			s += v > 0 ? v : 0;
 		}
@@ -345,7 +426,7 @@ static void raw_focus(const uint8_t *base) {
 
 /* Newest frame's statistics; a stopped camera returns its reason. */
 static const char *raw_poll(void) {
-	if (raw.fd < 0 || read(raw.fd, &raw.info, sizeof(raw.info)) != sizeof(raw.info)) {
+	if (raw.fd < 0 || !raw_read_info()) {
 		return raw.fd < 0 ? NULL : "gone";
 	}
 	if (raw.info.stopped) {
@@ -356,7 +437,10 @@ static const char *raw_poll(void) {
 	}
 	uint32_t was = raw.seq;
 	raw.seq = raw.info.seq;
-	const uint8_t *base = (const uint8_t *)raw.map + raw.info.index * (size_t)raw.info.area;
+	const uint8_t *base = raw_base(raw.info.index);
+	if (!base) {
+		return NULL;
+	}
 	if (raw.seq / AE_EVERY != was / AE_EVERY) {
 		raw_stats(base);
 	}
@@ -402,7 +486,15 @@ static bool raw_gl(void) {
 		"precision highp float; varying vec2 uv; uniform sampler2D bayer;"
 		"uniform vec2 size; uniform vec4 unpack; uniform vec2 first; uniform vec3 gain;"
 		"uniform mat3 ccm; uniform float black; uniform float shade;"
-		"float px(float x,float y){ return dot(texture2D(bayer,uv+vec2(x,y)/size),unpack); }"
+		"uniform float mipi; uniform float tw;"	/* (packed is reserved in GLSL ES) */
+		/* MIPI 10-bit: pixel x of a row is byte 5*(x/4)+x%4, its low bits in byte 5*(x/4)+4 */
+		"float px(float x,float y){"
+		" if(mipi<.5) return dot(texture2D(bayer,uv+vec2(x,y)/size),unpack);"
+		" vec2 p=clamp(floor(uv*size)+vec2(x,y),vec2(0.),size-1.);"
+		" float g=floor(p.x/4.), i=p.x-4.*g, row=(p.y+.5)/size.y;"
+		" float hi=floor(texture2D(bayer,vec2((5.*g+i+.5)/tw,row)).r*255.+.5);"
+		" float lo=floor(texture2D(bayer,vec2((5.*g+4.5)/tw,row)).r*255.+.5);"
+		" return (hi*4.+mod(floor(lo/pow(4.,i)),4.))/1023.; }"
 		"void main(){"
 		" float c=px(0.,0.);"
 		" float n1=px(0.,-1.),s1=px(0.,1.),w1=px(-1.,0.),e1=px(1.,0.);"
@@ -455,6 +547,8 @@ static bool raw_gl(void) {
 	raw.u_ccm = glGetUniformLocation(p, "ccm");
 	raw.u_black = glGetUniformLocation(p, "black");
 	raw.u_shade = glGetUniformLocation(p, "shade");
+	raw.u_packed = glGetUniformLocation(p, "mipi");
+	raw.u_tw = glGetUniformLocation(p, "tw");
 	raw.disp = d;
 	raw.d_pitch = glGetUniformLocation(d, "pitch");
 	raw.d_step = glGetUniformLocation(d, "step1");
@@ -479,19 +573,25 @@ static bool raw_import(unsigned i) {
 		create = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
 		target = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
 	}
-	if (raw.dmabuf < 0 || !create || !target) {
+	int fd = raw.backend == RAW_CAMSS ? (i < RAW_BUFS ? cs.dmabuf[i] : -1) : raw.dmabuf;
+	EGLint offset = raw.backend == RAW_CAMSS ? 0 : (EGLint)(i * raw.info.area);
+	if (fd < 0 || !create || !target) {
 		return false;
 	}
 	static const struct { uint32_t fourcc; float unpack[4]; } formats[] = {
 		{ FOURCC('R', '1', '6', ' '), { 65535.f / 1023, 0, 0, 0 } },
 		{ FOURCC('G', 'R', '8', '8'), { 255.f / 1023, 65280.f / 1023, 0, 0 } },
+		{ FOURCC('R', '8', ' ', ' '), { 0, 0, 0, 0 } },	/* packed: bytes, unpacked by the shader */
 	};
 	for (unsigned f = 0; f < sizeof(formats) / sizeof(formats[0]); f++) {
+		if (raw.packed != (formats[f].fourcc == FOURCC('R', '8', ' ', ' '))) {
+			continue;
+		}
 		EGLint at[] = {
-			EGL_WIDTH, (EGLint)raw.info.w, EGL_HEIGHT, (EGLint)raw.info.h,
+			EGL_WIDTH, raw.packed ? (EGLint)raw.info.stride : (EGLint)raw.info.w, EGL_HEIGHT, (EGLint)raw.info.h,
 			EGL_LINUX_DRM_FOURCC_EXT, (EGLint)formats[f].fourcc,
-			EGL_DMA_BUF_PLANE0_FD_EXT, raw.dmabuf,
-			EGL_DMA_BUF_PLANE0_OFFSET_EXT, (EGLint)(i * raw.info.area),
+			EGL_DMA_BUF_PLANE0_FD_EXT, fd,
+			EGL_DMA_BUF_PLANE0_OFFSET_EXT, offset,
 			EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)raw.info.stride,
 			EGL_NONE,
 		};
@@ -532,6 +632,18 @@ static void raw_upload(const uint8_t *base) {
 		raw_tex_params(GL_NEAREST);
 	}
 	glBindTexture(GL_TEXTURE_2D, raw.upload_tex);
+	if (raw.packed) {	/* the bytes as they are, one per texel */
+		glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+		if (tw != (int)raw.info.stride || th != (int)raw.info.h) {
+			tw = raw.info.stride;
+			th = raw.info.h;
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, tw, th, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, base);
+		} else {
+			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, tw, th, GL_LUMINANCE, GL_UNSIGNED_BYTE, base);
+		}
+		raw.zero_copy = false;
+		return;
+	}
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
 	if (tw != (int)raw.info.w || th != (int)raw.info.h) {
 		tw = raw.info.w;
@@ -549,7 +661,7 @@ static void raw_upload(const uint8_t *base) {
 /* The newest frame through the whole pipeline into the output texture. */
 static void raw_develop(void) {
 	unsigned i = raw.info.index;
-	const uint8_t *base = (const uint8_t *)raw.map + i * (size_t)raw.info.area;
+	const uint8_t *base = raw_base(i);
 	glActiveTexture(GL_TEXTURE0);
 	if (i < RAW_BUFS && raw_import(i)) {
 		glBindTexture(GL_TEXTURE_2D, raw.tex[i]);
@@ -589,12 +701,9 @@ static void raw_develop(void) {
 	glUseProgram(raw.prog);
 	glUniform2f(raw.u_size, (float)w, (float)h);
 	glUniform4fv(raw.u_unpack, 1, raw.unpack);
-	/* rear GB/RG: red at x 0, y 1. Front GR/BG: red at x 1, y 0. */
-	if (raw.info.bayer) {
-		glUniform2f(raw.u_first, 1, 0);
-	} else {
-		glUniform2f(raw.u_first, 0, 1);
-	}
+	glUniform1f(raw.u_packed, raw.packed ? 1.0f : 0.0f);
+	glUniform1f(raw.u_tw, (float)raw.info.stride);
+	glUniform2f(raw.u_first, (float)raw.first[0], (float)raw.first[1]);
 	/* no gain below 1, or a clipped white would come out tinted */
 	float low = fmin(fmin(raw.gain[0], raw.gain[1]), raw.gain[2]);
 	glUniform3f(raw.u_gain, raw.gain[0] / low, raw.gain[1] / low, raw.gain[2] / low);
@@ -675,9 +784,9 @@ static cairo_surface_t *raw_capture(void) {
 	raw_images_free();
 	if (full) {
 		/* the same time in lines: preview's line length over the full mode's */
-		double k = front ? (double)0x2970 / 0x13D0 : (double)0x0528 / 0x0A50;
+		double k = raw.backend == RAW_CAMSS ? cs.k : front ? (double)0x2970 / 0x13D0 : (double)0x0528 / 0x0A50;
 		int cf = (int)(c * k);
-		(void)read(raw.fd, &raw.info, sizeof(raw.info));
+		(void)raw_read_info();
 		raw_set_exposure(cf < 2 ? 2 : cf, g);
 		raw_set_focus(focus);
 		double until = raw_now() + 4;
@@ -686,7 +795,7 @@ static cairo_surface_t *raw_capture(void) {
 		while (raw_now() < until) {
 			struct timespec nap = { 0, 15000000 };
 			nanosleep(&nap, NULL);
-			if (read(raw.fd, &raw.info, sizeof(raw.info)) != sizeof(raw.info) || raw.info.stopped) {
+			if (!raw_read_info() || raw.info.stopped) {
 				break;
 			}
 			if (raw.info.seq >= first + 5) {
@@ -703,7 +812,8 @@ static cairo_surface_t *raw_capture(void) {
 		raw_images_free();
 		struct timespec nap = { 0, 300000000 };
 		nanosleep(&nap, NULL);
-		if (read(raw.fd, &raw.info, sizeof(raw.info)) != sizeof(raw.info) || !raw.info.seq) {
+		(void)raw_read_info();
+		if (!raw.info.seq) {
 			return NULL;
 		}
 		raw_set_exposure(c, g);
@@ -743,7 +853,7 @@ static cairo_surface_t *raw_capture(void) {
 		raw_say(front ? "front" : "rear");
 		raw_images_free();
 		raw.seq = 0;
-		if (read(raw.fd, &raw.info, sizeof(raw.info)) == sizeof(raw.info)) {
+		if (raw_read_info()) {
 			raw_set_exposure(c, g);
 			raw_set_focus(focus);
 			raw.coarse = c;

@@ -64,7 +64,7 @@ APP_LIBS = $(DM_WRAP_LDFLAGS) $(shell pkg-config --libs $(APP_PKGS)) $(IAL_LIBS)
 
 # ztCamera: the camera, in the Lumia Camera look (see camera/CAMERA-DRIVERS.md
 # for why its viewfinder runs against a source that is not a sensor)
-camera/ztcamera: camera/ztcamera.c $(CORE_DEPS)
+camera/ztcamera: camera/ztcamera.c camera/raw-source.h camera/camss-source.h $(CORE_DEPS)
 	$(APP_BUILD) -o $@ camera/ztcamera.c $(CORE) $(APP_LIBS)
 
 settings/ztsettings: settings/ztsettings.c settings/boostpage.h $(CORE_DEPS)

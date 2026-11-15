@@ -386,7 +386,7 @@ static void source_start(enum source_kind want) {
 			break;
 		}
 		note("%s", raw.cam == RAW_IR ? "IR camera: the sensor does not answer yet"
-			: "no camera driver (" RAW_DEV ")");
+			: "no camera driver (" RAW_DEV " or CAMSS)");
 		/* fall through */
 	case SRC_V4L2:
 		if (device_path && v4l2_open(device_path)) {
@@ -1497,7 +1497,7 @@ static void source_cycle(void) {
 		note("stop recording before changing source");
 		return;
 	}
-	if (src.kind == SRC_SCENE && !replay_path && !device_path && access(RAW_DEV, F_OK) == 0) {
+	if (src.kind == SRC_SCENE && !replay_path && !device_path && raw_available()) {
 		raw.cam = RAW_REAR;
 		source_start(SRC_RAW);
 	} else if (src.kind == SRC_SCENE) {
@@ -1906,7 +1906,7 @@ static void arrived(int page) {
 	roll_scan();
 	thumb_load();
 	source_start(device_path ? SRC_V4L2 : replay_path ? SRC_REPLAY :
-		access(RAW_DEV, F_OK) == 0 ? SRC_RAW : SRC_SCENE);
+		raw_available() ? SRC_RAW : SRC_SCENE);
 	if (src.kind == SRC_SCENE) {
 		snprintf(src.name, sizeof(src.name), "test scene 640x480");
 	}
@@ -2015,7 +2015,8 @@ int main(int argc, char **argv) {
 		if (dial_arg < -1 || dial_arg >= N_CONTROLS) return 2;
 		return render_png(out_png, dial_arg);
 	}
-	if (!device_path && !replay_path && access("/dev/video0", R_OK | W_OK) == 0) {
+	/* /dev/video0 as an ordinary camera, unless it is a raw one's (CAMSS's RDI node is) */
+	if (!device_path && !replay_path && !raw_available() && access("/dev/video0", R_OK | W_OK) == 0) {
 		device_path = "/dev/video0";
 	}
 	int status = zmc_run(&camera, 0);
