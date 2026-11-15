@@ -560,8 +560,22 @@ class Daemon:
         with open(DATA_WISH, 'w') as f:
             f.write('1\n' if on else '0\n')
         nmcli('connection', 'modify', NM_CONNECTION, 'connection.autoconnect', 'yes' if on else 'no')
-        nmcli('connection', 'up' if on else 'down', NM_CONNECTION, wait=False)
+        if on:
+            # autoconnect = yes is enough: NetworkManager starts the connection at
+            # once. A `connection up` on top of that made NetworkManager drop its own
+            # attempt halfway for a new one, and ModemManager (1.24 on the Poco F1)
+            # crashed between the two: the phone showed no SIM until it restarted.
+            # Bring it up by hand only if NetworkManager has not started it.
+            GLib.timeout_add_seconds(3, self.data_kick)
+        else:
+            nmcli('connection', 'down', NM_CONNECTION, wait=False)
         self.publish()
+
+    def data_kick(self):
+        if self.data_on and not any(line.startswith(NM_CONNECTION + ':') for line in
+                                    nmcli('-t', '-f', 'NAME,STATE', 'connection', 'show', '--active').splitlines()):
+            nmcli('connection', 'up', NM_CONNECTION, wait=False)
+        return False
 
     def data_look(self):
         """Whether the connection is up, with which address; and NM's WWAN
