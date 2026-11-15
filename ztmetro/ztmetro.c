@@ -685,7 +685,7 @@ struct zt_server {
 	struct wl_event_source *volume_timer;
 	/* Power + Volume down: a screenshot. Power waits a moment (shot_timer) for
 	 * volume down before it turns the screen off */
-	struct wl_event_source *shot_timer, *shot_note_timer;
+	struct wl_event_source *shot_timer, *shot_note_timer, *shot_grab_timer;
 	bool power_pending, vol_down_held;
 	char shot_path[256];
 	struct wl_event_source *volume_repeat_timer, *volume_pip_timer;
@@ -10301,8 +10301,19 @@ static void uninstall_item(struct zt_server *server, int index) {
 static void screen_set(struct zt_server *server, bool on);
 static void activity(struct zt_server *server);
 
+/* The capture itself, once the screen shows what is to be kept. */
+static int screenshot_grab(void *data) {
+	struct zt_server *server = data;
+	run_detached("sh", "-c", "mkdir -p \"$(dirname \"$0\")\" && exec grim \"$0\"", server->shot_path);
+	wl_event_source_timer_update(server->shot_note_timer, 600);
+	wlr_log(WLR_INFO, "screenshot: %s", server->shot_path);
+	return 0;
+}
+
 /* A screenshot of the whole screen into ~/Pictures/Screenshots (grim, through
- * the screencopy protocol); its notice comes after, so it is not in the picture */
+ * the screencopy protocol); its notice comes after, so it is not in the picture.
+ * Volume down first brings the volume panel down: it goes at once, and the
+ * capture waits for a frame without it. */
 static void screenshot_take(struct zt_server *server) {
 	const char *home = getenv("HOME");
 	time_t t = time(NULL);
@@ -10312,9 +10323,15 @@ static void screenshot_take(struct zt_server *server) {
 	strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm);
 	snprintf(server->shot_path, sizeof(server->shot_path), "%s/Pictures/Screenshots/Screenshot_%s.png",
 		home ? home : "/tmp", stamp);
-	run_detached("sh", "-c", "mkdir -p \"$(dirname \"$0\")\" && exec grim \"$0\"", server->shot_path);
-	wl_event_source_timer_update(server->shot_note_timer, 600);
-	wlr_log(WLR_INFO, "screenshot: %s", server->shot_path);
+	float hidden = (float)-(VOLUME_H + MEDIA_H + OUTPUT_H);
+	if (server->volume_y > hidden + 1.0f) {
+		wl_event_source_timer_update(server->volume_timer, 0);
+		animate(server, &server->volume_y, hidden, 1, 0, false);
+		damage(server);
+		wl_event_source_timer_update(server->shot_grab_timer, 120);
+		return;
+	}
+	screenshot_grab(server);
 }
 
 static int screenshot_noted(void *data) {
@@ -14643,6 +14660,7 @@ int main(int argc, char *argv[]) {
 	server.volume_timer = wl_event_loop_add_timer(server.loop, volume_hide, &server);
 	server.shot_timer = wl_event_loop_add_timer(server.loop, power_alone, &server);
 	server.shot_note_timer = wl_event_loop_add_timer(server.loop, screenshot_noted, &server);
+	server.shot_grab_timer = wl_event_loop_add_timer(server.loop, screenshot_grab, &server);
 	server.volume_repeat_timer = wl_event_loop_add_timer(server.loop, volume_repeat, &server);
 	server.volume_pip_timer = wl_event_loop_add_timer(server.loop, volume_pip, &server);
 	server.peek_timer = wl_event_loop_add_timer(server.loop, peek_timed_out, &server);
