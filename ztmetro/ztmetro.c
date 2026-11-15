@@ -9855,10 +9855,17 @@ static void perf_tell(const char *command) {
  * background, into $XDG_RUNTIME_DIR/ztos-outputs ("*|name|description" for the
  * default, "-|..." for the others), and the banner only reads that file, so
  * drawing never waits on PipeWire. */
+/* Every sink, but not one whose port says nothing is plugged in (the
+ * headphone output with an empty jack), unless it is the default now: tapping
+ * the output name cycled to the headphones and the sound went nowhere. */
 #define OUTPUTS_SH \
 	"d=$(pactl get-default-sink 2>/dev/null); f=$XDG_RUNTIME_DIR/ztos-outputs; " \
-	"pactl list sinks 2>/dev/null | awk -v d=\"$d\" '/^\\tName:/ { n = $2 } " \
-	"/^\\tDescription:/ { sub(/^\\tDescription: /, \"\"); print (n == d ? \"*\" : \"-\") \"|\" n \"|\" $0 }' " \
+	"pactl list sinks 2>/dev/null | awk -v d=\"$d\" 'function out() { if (n != \"\" && (!gone || n == d)) " \
+	"print (n == d ? \"*\" : \"-\") \"|\" n \"|\" desc; n = \"\"; gone = 0 } " \
+	"/^Sink #/ { out() } /^\\tName:/ { n = $2 } " \
+	"/^\\tDescription:/ { desc = $0; sub(/^\\tDescription: /, \"\", desc) } " \
+	"/^\\t\\t\\[Out\\] / { p = $2; sub(/:$/, \"\", p); off[p] = /not available\\)/ } " \
+	"/^\\tActive Port:/ { gone = off[$NF] } END { out() }' " \
 	"> \"$f.new\" && mv \"$f.new\" \"$f\""
 static void outputs_refresh(void) {
 	run_detached("sh", "-c", OUTPUTS_SH, NULL);
