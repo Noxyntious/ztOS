@@ -28,6 +28,8 @@ libinput
 xkeyboard-config
 libxkbcommon
 cairo
+# screenshots: Power + Volume down runs it (wlr-screencopy)
+grim
 pango
 librsvg
 pixman

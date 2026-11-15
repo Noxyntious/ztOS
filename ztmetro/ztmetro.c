@@ -683,6 +683,11 @@ struct zt_server {
 	char media_title[100], media_artist[80];
 	struct zt_layer volume_layer;
 	struct wl_event_source *volume_timer;
+	/* Power + Volume down: a screenshot. Power waits a moment (shot_timer) for
+	 * volume down before it turns the screen off */
+	struct wl_event_source *shot_timer, *shot_note_timer;
+	bool power_pending, vol_down_held;
+	char shot_path[256];
 	struct wl_event_source *volume_repeat_timer, *volume_pip_timer;
 	int volume_repeat_by;	/* +1 or -1 while a volume key is held, else 0 */
 	/* Lumia Metro top modal dialog */
@@ -10293,6 +10298,45 @@ static void uninstall_item(struct zt_server *server, int index) {
 	note_add(server, "System", "Removal started", name);
 }
 
+static void screen_set(struct zt_server *server, bool on);
+static void activity(struct zt_server *server);
+
+/* A screenshot of the whole screen into ~/Pictures/Screenshots (grim, through
+ * the screencopy protocol); its notice comes after, so it is not in the picture */
+static void screenshot_take(struct zt_server *server) {
+	const char *home = getenv("HOME");
+	time_t t = time(NULL);
+	struct tm tm;
+	localtime_r(&t, &tm);
+	char stamp[32];
+	strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm);
+	snprintf(server->shot_path, sizeof(server->shot_path), "%s/Pictures/Screenshots/Screenshot_%s.png",
+		home ? home : "/tmp", stamp);
+	run_detached("sh", "-c", "mkdir -p \"$(dirname \"$0\")\" && exec grim \"$0\"", server->shot_path);
+	wl_event_source_timer_update(server->shot_note_timer, 600);
+	wlr_log(WLR_INFO, "screenshot: %s", server->shot_path);
+}
+
+static int screenshot_noted(void *data) {
+	struct zt_server *server = data;
+	const char *name = strrchr(server->shot_path, '/');
+	note_add_from(server, "ztOS", "screenshot", "Screenshot saved", name ? name + 1 : server->shot_path);
+	return 0;
+}
+
+/* No volume down came: what the power key does by itself */
+static int power_alone(void *data) {
+	struct zt_server *server = data;
+	if (server->power_pending) {
+		server->power_pending = false;
+		screen_set(server, !server->screen_on);
+		if (server->screen_on) {
+			activity(server);
+		}
+	}
+	return 0;
+}
+
 static int volume_hide(void *data) {
 	struct zt_server *server = data;
 	animate(server, &server->volume_y, (float)-(VOLUME_H + MEDIA_H + OUTPUT_H), 180, 0, false);
@@ -12569,11 +12613,29 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 	struct zt_keyboard *keyboard = wl_container_of(listener, keyboard, key);
 	struct zt_server *server = keyboard->server;
 	struct wlr_keyboard_key_event *event = data;
+	if (event->keycode == KEY_VOLUMEDOWN) {
+		server->vol_down_held = event->state == WL_KEYBOARD_KEY_STATE_PRESSED;
+		if (server->vol_down_held && server->power_pending) {
+			/* power, then volume down within the moment: a screenshot */
+			server->power_pending = false;
+			wl_event_source_timer_update(server->shot_timer, 0);
+			screenshot_take(server);
+			return;
+		}
+	}
 	if (event->keycode == KEY_POWER) {
-		/* the power key sleeps and wakes the screen, and goes no further */
+		/* the power key sleeps and wakes the screen, and goes no further; with
+		 * volume down (either first) it takes a screenshot instead */
 		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-			screen_set(server, !server->screen_on);
-			if (server->screen_on) {
+			if (server->screen_on && server->vol_down_held) {
+				server->volume_repeat_by = 0;	/* volume down held: no more steps */
+				wl_event_source_timer_update(server->volume_repeat_timer, 0);
+				screenshot_take(server);
+			} else if (server->screen_on) {
+				server->power_pending = true;	/* off after a moment, unless volume down */
+				wl_event_source_timer_update(server->shot_timer, 150);
+			} else {
+				screen_set(server, true);	/* waking is at once */
 				activity(server);
 			}
 		}
@@ -14579,6 +14641,8 @@ int main(int argc, char *argv[]) {
 	wl_event_loop_add_signal(server.loop, SIGHUP, reload, &server);
 	server.launch_timer = wl_event_loop_add_timer(server.loop, launch_timed_out, &server);
 	server.volume_timer = wl_event_loop_add_timer(server.loop, volume_hide, &server);
+	server.shot_timer = wl_event_loop_add_timer(server.loop, power_alone, &server);
+	server.shot_note_timer = wl_event_loop_add_timer(server.loop, screenshot_noted, &server);
 	server.volume_repeat_timer = wl_event_loop_add_timer(server.loop, volume_repeat, &server);
 	server.volume_pip_timer = wl_event_loop_add_timer(server.loop, volume_pip, &server);
 	server.peek_timer = wl_event_loop_add_timer(server.loop, peek_timed_out, &server);
