@@ -2066,15 +2066,29 @@ static struct {
 	char status[120];
 } bt;
 
-/* "yes|no", then "@devices" and one "MAC|name|paired|connected|icon" each */
+/* "yes|no", then "@devices" and one "MAC|name|paired|connected|icon" each. The
+ * fields are matched at the start of the line: bluez 5.88 also prints
+ * LE.Paired and LE.Connected, and a second match split the row in two (the
+ * rest showed as a device called "no"). */
 #define BT_QUERY "p=$(bluetoothctl show 2>/dev/null | sed -n 's/.*Powered: //p'); echo \"${p:-no}\"; " \
 	"echo @devices; bluetoothctl devices 2>/dev/null | while read -r _ mac name; do " \
 	"i=$(bluetoothctl info \"$mac\" 2>/dev/null); " \
-	"echo \"$mac|$name|$(echo \"$i\" | sed -n 's/.*Paired: //p')|$(echo \"$i\" | sed -n 's/.*Connected: //p')|" \
-	"$(echo \"$i\" | sed -n 's/.*Icon: //p')\"; done"
+	"echo \"$mac|$name|$(echo \"$i\" | sed -n 's/^[[:space:]]*Paired: //p' | head -1)|" \
+	"$(echo \"$i\" | sed -n 's/^[[:space:]]*Connected: //p' | head -1)|" \
+	"$(echo \"$i\" | sed -n 's/^[[:space:]]*Icon: //p' | head -1)\"; done"
 static FILE *bt_pipe;
 static char bt_buf[8192];
 static size_t bt_len;
+
+/* "71-13-58-0B-BE-DC": the address bluez gives a device that sent no name */
+static bool bt_nameless(const char *name) {
+	if (!name[0]) return true;
+	if (strlen(name) != 17) return false;
+	for (int i = 0; i < 17; i++) {
+		if (i % 3 == 2 ? name[i] != '-' && name[i] != ':' : !isxdigit((unsigned char)name[i])) return false;
+	}
+	return true;
+}
 
 static void bt_parse(char *text) {
 	bool devices = false;
@@ -2091,6 +2105,11 @@ static void bt_parse(char *text) {
 				if (!bar) break;
 				*bar = 0;
 				f[i] = bar + 1;
+			}
+			/* a device that gives no name (bluez names it by its address, with
+			 * dashes): nearby LE gadgets nobody pairs with. Listed once paired. */
+			if (!(strncmp(f[2], "yes", 3) == 0 || strncmp(f[3], "yes", 3) == 0) && bt_nameless(f[1])) {
+				continue;
 			}
 			struct bt_device *d = &bt.dev[bt.n++];
 			snprintf(d->mac, sizeof(d->mac), "%s", f[0]);
