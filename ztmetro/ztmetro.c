@@ -688,6 +688,7 @@ struct zt_server {
 	struct wl_event_source *shot_timer, *shot_note_timer, *shot_grab_timer, *shot_pump_timer;
 	uint32_t shot_pump_until;
 	bool power_pending, vol_down_held;
+	bool wifi_link;			/* a wireless interface up, as net_tick saw it last */
 	char shot_path[256];
 	struct wl_event_source *volume_repeat_timer, *volume_pip_timer;
 	int volume_repeat_by;	/* +1 or -1 while a volume key is held, else 0 */
@@ -5341,6 +5342,13 @@ static void status_pop_end(cairo_t *cr, float t) {
  * drawn in three places; nothing wakes up to ask. */
 static int wifi_bars(struct zt_server *server) {
 	uint32_t now = now_ms();
+	/* no link is no Wi-Fi, whatever was read last: the radio turned off showed
+	 * the old bars (often none lit, a dot) for up to the 40 s kept below */
+	if (!wifi_up()) {
+		server->wifi_read_ms = now ? now : 1;
+		server->wifi_bars = -1;
+		return -1;
+	}
 	/* If ztoscorenetworkingd reported active bars, use it */
 	if (server->wifi_read_ms && now - server->wifi_read_ms < 40000 && server->wifi_bars >= 0) {
 		return server->wifi_bars;
@@ -6167,6 +6175,13 @@ static int net_tick(void *data) {
 	server->net_active = active;
 
 	if (bt_state_read(server)) {
+		redraw = true;
+	}
+	/* the Wi-Fi link coming or going: the row at once, not at the next minute */
+	bool link = wifi_up();
+	if (link != server->wifi_link) {
+		server->wifi_link = link;
+		server->wifi_read_ms = 0;
 		redraw = true;
 	}
 	live_tick(server);
