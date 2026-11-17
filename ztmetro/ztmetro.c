@@ -505,6 +505,13 @@ struct zt_output {
 	struct wlr_output *wlr_output;
 	struct wl_listener frame, request_state, destroy;
 	struct wlr_buffer *last_submitted; /* identity only; never dereferenced */
+	/* Ours, not wlr_output's: wlroots destroys output->swapchain whenever the
+	 * output is disabled, so every screen off/on built a new one, and on the
+	 * Pixel 8 Pro (scanout buffers from a fixed CMA pool, 15.5 MiB each) the
+	 * old buffers were never all given back: the pool ran dry after a few
+	 * dozen wakes and the screen stayed black. This one lives as long as the
+	 * output and is reused by every frame and every wake. */
+	struct wlr_swapchain *swapchain;
 };
 
 struct zt_server {
@@ -10461,6 +10468,35 @@ static void tone_rgb(int kelvin, float rgb[3]) {
 
 /* Switch the display itself off or on. Off, nothing is drawn and no frames
  * are scheduled; the power key brings it back. */
+/* A black buffer from our swapchain for the commit that turns the panel on,
+ * locked for the caller; NULL to let wlroots find one (the old way). */
+static struct wlr_buffer *screen_wake_buffer(struct zt_server *server,
+		struct wlr_output_state *state) {
+	struct wlr_output *output = server->output->wlr_output;
+	if (!server->egl_context ||
+			!wlr_output_configure_primary_swapchain(output, state, &server->output->swapchain)) {
+		return NULL;
+	}
+	struct wlr_buffer *buffer = wlr_swapchain_acquire(server->output->swapchain);
+	if (!buffer) {
+		return NULL;
+	}
+	GLuint fbo = wlr_gles2_renderer_get_buffer_fbo(server->renderer, buffer);
+	if (!fbo || !gl_begin(server)) {
+		wlr_buffer_unlock(buffer);
+		return NULL;
+	}
+	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+	glViewport(0, 0, output->width, output->height);
+	glDisable(GL_SCISSOR_TEST);
+	glClearColor(0, 0, 0, 1);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glFinish();
+	gl_end(server);
+	return buffer;
+}
+
 static void screen_set(struct zt_server *server, bool on) {
 	if (!on) {
 		server->dm_hidden = 1;	/* the DotMatrix home boots again when it is next seen */
@@ -10505,12 +10541,24 @@ static void screen_set(struct zt_server *server, bool on) {
 	struct wlr_output_state state;
 	wlr_output_state_init(&state);
 	wlr_output_state_set_enabled(&state, on);
+	/* Light the panel up with a frame from our own swapchain: an enabling
+	 * commit without a buffer makes wlroots allocate a swapchain of its own
+	 * for it (see struct zt_output). Black: the first real frame follows. */
+	struct wlr_buffer *wake = on ? screen_wake_buffer(server, &state) : NULL;
+	if (wake) {
+		wlr_output_state_set_buffer(&state, wake);
+	}
 	if (!wlr_output_commit_state(server->output->wlr_output, &state)) {
 		wlr_log(WLR_ERROR, "screen: could not switch the display %s", on ? "on" : "off");
 		wlr_output_state_finish(&state);
+		if (wake) wlr_buffer_unlock(wake);
 		return;
 	}
 	wlr_output_state_finish(&state);
+	if (wake) {
+		server->output->last_submitted = wake;
+		wlr_buffer_unlock(wake);
+	}
 	server->screen_on = on;
 	if (demoloop_active()) {
 		char path[256];
@@ -13350,12 +13398,12 @@ static void render_frame(struct zt_server *server) {
 
 	struct wlr_output_state state;
 	wlr_output_state_init(&state);
-	if (!wlr_output_configure_primary_swapchain(output, &state, &output->swapchain)) {
+	if (!wlr_output_configure_primary_swapchain(output, &state, &server->output->swapchain)) {
 		wlr_output_state_finish(&state);
 		render_retry_later(server);
 		return;
 	}
-	struct wlr_buffer *buffer = wlr_swapchain_acquire(output->swapchain);
+	struct wlr_buffer *buffer = wlr_swapchain_acquire(server->output->swapchain);
 	if (!buffer) {
 		wlr_output_state_finish(&state);
 		render_retry_later(server);
@@ -13366,7 +13414,7 @@ static void render_frame(struct zt_server *server) {
 		 * again while it is scanned out, the screen went black but for
 		 * the first tiles drawn (seen as a live tile turned). Hold it so
 		 * the swapchain gives another, and draw into that one. */
-		struct wlr_buffer *other = wlr_swapchain_acquire(output->swapchain);
+		struct wlr_buffer *other = wlr_swapchain_acquire(server->output->swapchain);
 		wlr_buffer_unlock(buffer);
 		if (!other || other == server->output->last_submitted) {
 			wlr_log(WLR_ERROR, "output: only the scanout buffer is free; the frame waits");
@@ -14112,6 +14160,7 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 	if (output->server->output == output) {
 		output->server->output = NULL;
 	}
+	wlr_swapchain_destroy(output->swapchain);
 	free(output);
 }
 
