@@ -894,6 +894,7 @@ struct zt_server {
 	char key_prefix[32];
 	int ring_volume;
 	bool volume_is_media;
+	bool volume_pinned;	/* picked on the banner's ring | media switch */
 	bool audio_active, audio_known;
 	int key_sound_fd;
 	bool osk_shift, osk_ctrl, osk_alt;
@@ -9898,6 +9899,14 @@ static double banner_h(struct zt_server *server) {
 	return VOLUME_H + (server->media ? MEDIA_H : 0) + OUTPUT_H;
 }
 
+/* The banner's ring | media switch, at the right of the level row: which
+ * volume the keys work. The keys pick it themselves (media while something
+ * plays), a tap on the switch overrides that for as long as the banner is up. */
+#define VOLUME_SEG_W 58
+static double volume_switch_x(struct zt_server *server) {
+	return server->width - 16 - 2 * VOLUME_SEG_W;
+}
+
 static void draw_volume(struct zt_server *server) {
 	cairo_t *cr;
 	double height = banner_h(server);
@@ -9910,7 +9919,20 @@ static void draw_volume(struct zt_server *server) {
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	draw_text(cr, text, FONT_SEMILIGHT, 26, 16, 8, 0, 0, false);
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	draw_text(cr, server->volume_is_media ? "media + apps" : (level ? "ringer + notifications" : "vibrate"), FONT_REGULAR, 12, 108, 20, 0, 0, false);
+	double sx = volume_switch_x(server);
+	draw_text(cr, server->volume_is_media ? "media + apps" : (level ? "ringer + notifications" : "vibrate"),
+		FONT_REGULAR, 12, 108, 20, sx - 108 - 8, 0, false);
+	for (int k = 0; k < 2; k++) {
+		bool on = (k == 1) == server->volume_is_media;
+		double x0 = sx + k * VOLUME_SEG_W;
+		if (on) set_rgb(cr, server->accent);
+		else cairo_set_source_rgb(cr, 0.45, 0.45, 0.45);
+		draw_text(cr, k ? "media" : "ring", FONT_SEMIBOLD, 13.5, x0, 6, VOLUME_SEG_W, VOLUME_H - 22, true);
+		if (on) {
+			cairo_rectangle(cr, x0 + 12, VOLUME_H - 20, VOLUME_SEG_W - 24, 2);
+			cairo_fill(cr);
+		}
+	}
 	cairo_set_source_rgb(cr, 0.25, 0.25, 0.25);
 	cairo_rectangle(cr, 16, VOLUME_H - 9, server->width - 32, 3);
 	cairo_fill(cr);
@@ -10285,8 +10307,11 @@ static int volume_pip(void *data) {
 }
 
 static void volume_step(struct zt_server *server, int by) {
-    /* the stream is chosen on the first press; repeats keep it */
-    if (!server->volume_repeat_by)
+    /* the stream is chosen on the first press; repeats keep it, and so does
+     * a pick on the banner's switch while the banner is still up */
+    if (server->volume_y <= -10.0f)
+        server->volume_pinned = false;
+    if (!server->volume_repeat_by && !server->volume_pinned)
         server->volume_is_media = server->audio_known ? server->audio_active : server->media_playing;
     int *level = server->volume_is_media ? &server->volume : &server->ring_volume;
     int previous = *level, to = previous + by;
@@ -11046,6 +11071,15 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 		return;
 	}
 	if (server->volume_y > -10.0f && y < banner_h(server) && !server->locked) {
+		/* the level row's switch: which volume the keys work */
+		if (y < VOLUME_H && x >= volume_switch_x(server)) {
+			bool media = x >= volume_switch_x(server) + VOLUME_SEG_W;
+			hap(server, HAP_TAP, HG_SYSTEM);
+			server->volume_is_media = media;
+			server->volume_pinned = true;
+			draw_volume(server);
+			damage(server);
+		}
 		/* the volume banner: its three buttons work the player */
 		if (server->media && y >= VOLUME_H && y < VOLUME_H + MEDIA_H) {
 			double bw = 46, bx = server->width - 16 - 3 * bw;
