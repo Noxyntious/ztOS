@@ -1,0 +1,21 @@
+# ztOS device manifest: Google Pixel 8 Pro (husky, Tensor G3), mainline kernel.
+# Interfaces not named here use their generic backend.
+
+[device]
+name = "Google Pixel 8 Pro"
+codename = "husky"
+
+[ial.Perf1]
+# Battery draw zrnperfd holds under (the S9's 1000 mA is about what this phone
+# draws with only the screen and the 5G modem on). Released below 1700 mA.
+power_limit_ma = 2000
+power_release_ma = 1700
+
+[ial.Perf1.ceilings]
+# kHz per boost rung: [idle0, nominal, interactive, big]; rapid is always the top.
+# Start screen: every cluster near 1.2-1.3 GHz (the X3 no longer parked at 500 MHz).
+# An app in front: each cluster's full range, schedutil + EAS (energy model in
+# the DT) pick the frequency; the kernel's IPA thermal governor caps at 70 C.
+policy0 = [1328000, 1704000, 1704000, 1704000]   # 4x Cortex-A510
+policy4 = [1328000, 2367000, 2367000, 2367000]   # 4x Cortex-A715
+policy8 = [1164000, 2914000, 2914000, 2914000]   # 1x Cortex-X3

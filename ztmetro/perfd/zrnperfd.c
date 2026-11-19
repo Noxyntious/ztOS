@@ -826,8 +826,11 @@ static bool thermal_update(void) {
  * Asked for 2026-10-26: "aggressively keep the power draw under 1000mA on
  * normal operation". Plugged in, the current is the charger's, and the limit
  * is off. */
-#define POWER_LIMIT_UA		1000000
-#define POWER_RELEASE_UA	850000
+/* the S9's limit; a phone's Perf1 power_limit_ma/power_release_ma replace it
+ * (perfial_power_limit_ua(): the Pixel 8 Pro draws ~1 A with just the screen
+ * and the 5G modem on, so 1000 mA throttled it at once, 2026-11-19) */
+#define POWER_LIMIT_UA		perfial_power_limit_ua()
+#define POWER_RELEASE_UA	perfial_power_release_ua()
 #define POWER_TAKE_MS		750
 #define POWER_GIVE_MS		5000
 #define POWER_LEVELS		5
@@ -1047,8 +1050,13 @@ static void apply(void) {
 		 * rapid; the big cluster climbing 1.07 -> 1.8 -> 2.3 GHz -> top */
 		bool top_speed = (profile == PERFORMANCE && screen_on && thermal_level == 0) || boost == RAPID;
 		long max;
+		/* the phone's own ladder (Perf1 ceil.policyN), when it gives one:
+		 * the S9 constants below are for its 4+4 Exynos 9810 */
+		long ceil = perfial_ceiling(clusters[c], boost);
 		if (top_speed) {
 			max = table[n - 1];
+		} else if (ceil > 0) {
+			max = nearest(table, n, ceil);
 		} else if (idle0) {
 			max = big ? table[0] : nearest(table, n, IDLE_KHZ_TARGET);
 		} else if (!big) {

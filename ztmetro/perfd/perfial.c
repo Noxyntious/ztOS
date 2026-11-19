@@ -25,6 +25,8 @@ static struct {
 	bool celsius;
 	char gpu[192];
 	char battery[192];
+	long ceil[MAX_POLICY][PERFIAL_RUNGS];	/* [policy][rung] kHz, 0 unset */
+	long power_limit_ua, power_release_ua;	/* 0 unset */
 } ial;
 
 static const char *const thermal_names[] = { "big", "little", "gpu" };
@@ -63,6 +65,19 @@ bool perfial_load(void)
 			snprintf(ial.gpu, sizeof(ial.gpu), "%s", value);
 		} else if (!strcmp(line, "battery_current")) {
 			snprintf(ial.battery, sizeof(ial.battery), "%s", value);
+		} else if (sscanf(line, "ceil.policy%d", &policy) == 1 &&
+			   policy >= 0 && policy < MAX_POLICY) {
+			/* ceil.policyN=idle0,nominal,interactive,big (kHz) */
+			char *p = value;
+			for (int r = 0; r < PERFIAL_RUNGS && *p; r++) {
+				ial.ceil[policy][r] = strtol(p, &p, 10);
+				if (*p == ',')
+					p++;
+			}
+		} else if (!strcmp(line, "power_limit_ma")) {
+			ial.power_limit_ua = atol(value) * 1000;
+		} else if (!strcmp(line, "power_release_ma")) {
+			ial.power_release_ua = atol(value) * 1000;
 		}
 	}
 	fclose(f);
@@ -109,6 +124,27 @@ const char *perfial_thermal(const char *name)
 		return fallback[i];
 	}
 	return NULL;
+}
+
+long perfial_ceiling(int policy, int rung)
+{
+	if (!ial.loaded || policy < 0 || policy >= MAX_POLICY ||
+	    rung < 0 || rung >= PERFIAL_RUNGS)
+		return 0;
+	return ial.ceil[policy][rung];
+}
+
+long perfial_power_limit_ua(void)
+{
+	return ial.loaded && ial.power_limit_ua > 0 ? ial.power_limit_ua : 1000000;
+}
+
+long perfial_power_release_ua(void)
+{
+	long limit = perfial_power_limit_ua();
+	if (ial.loaded && ial.power_release_ua > 0 && ial.power_release_ua < limit)
+		return ial.power_release_ua;
+	return limit * 85 / 100;	/* the S9's 850 of 1000 mA */
 }
 
 bool perfial_celsius(void)

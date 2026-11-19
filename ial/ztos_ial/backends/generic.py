@@ -121,6 +121,12 @@ class Perf(Backend):
                 lines.append(f"cap.{cluster['policy']}.{online}={khz}")
         for name, path in t['thermal'].items():
             lines.append(f'thermal.{name}={path}')
+        for policy, rungs in sorted(t.get('ceilings', {}).items()):
+            lines.append(f"ceil.{policy}=" + ','.join(str(int(k)) for k in rungs))
+        if t.get('power_limit_ma'):
+            lines.append(f"power_limit_ma={int(t['power_limit_ma'])}")
+        if t.get('power_release_ma'):
+            lines.append(f"power_release_ma={int(t['power_release_ma'])}")
         lines += [f"thermal_unit={t['thermal_unit']}",
                   'thermal_marks=' + ','.join(str(m) for m in t['thermal_marks']),
                   f"gpu_devfreq={t['gpu_devfreq']}",
@@ -157,6 +163,12 @@ class Perf(Backend):
             'thermal_marks': self.config.get('thermal_marks', [70, 76, 82]),
             'gpu_devfreq': gpu,
             'battery_current_node': self.manifest.get('ial', {}).get('Power1', {}).get('current_node', ''),
+            # zrnperfd's ladder for this phone: policyN = [idle0, nominal,
+            # interactive, big] ceilings in kHz (rapid is always the top),
+            # and its battery-draw limit; absent = the Galaxy S9's built-ins
+            'ceilings': {k: list(v) for k, v in self.config.get('ceilings', {}).items()},
+            'power_limit_ma': self.config.get('power_limit_ma'),
+            'power_release_ma': self.config.get('power_release_ma'),
         }
 
     def props(self):

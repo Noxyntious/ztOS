@@ -27,5 +27,14 @@ const char *perfial_battery_current(void);
 /* a file under the GPU's devfreq node ("max_freq"), in one of four rotating
  * buffers, so a few can be used in one statement */
 const char *perfial_gpu_file(const char *leaf);
+/* the ceiling of policyN's cluster at a boost rung (0 idle0, 1 nominal,
+ * 2 interactive, 3 big), in kHz; 0 when the phone sets none (then zrnperfd's
+ * built-in Galaxy S9 ladder applies) */
+long perfial_ceiling(int policy, int rung);
+#define PERFIAL_RUNGS	4
+/* the battery-draw limit and the level it is released under, in uA; the
+ * S9's 1000/850 mA unless the phone sets power_limit_ma/power_release_ma */
+long perfial_power_limit_ua(void);
+long perfial_power_release_ua(void);
 
 #endif
