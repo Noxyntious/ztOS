@@ -1,0 +1,7 @@
+# Pixel 8 Pro skin-temperature zone (battery thermistor, kernel DT
+# "skin-thermal"): proportional-only IPA. The cell's thermal mass is slow, so an
+# integral term winds up for minutes and then pins every CPU cluster and the
+# GPU at their lowest clocks long after the case has cooled. k_po 300
+# (~290 mW per degree over 41 C) pulls the 2.2 W CPU+GPU budget to zero at
+# about +7.5 C.
+ACTION=="add", SUBSYSTEM=="thermal", KERNEL=="thermal_zone*", ATTR{type}=="skin-thermal", ATTR{k_i}="0", ATTR{k_po}="300"

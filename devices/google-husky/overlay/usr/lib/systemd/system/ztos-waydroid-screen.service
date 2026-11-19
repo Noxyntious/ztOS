@@ -1,0 +1,11 @@
+[Unit]
+Description=ztOS: Waydroid's Android sleeps while the screen is off
+After=waydroid-container.service
+
+[Service]
+ExecStart=/usr/local/libexec/ztos-waydroid-screen
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

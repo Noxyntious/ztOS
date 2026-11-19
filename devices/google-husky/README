@@ -10,6 +10,10 @@ overlay/                   rootfs files the port adds on top of the ztOS image:
   ztos-husky-hw            boot-time hardware setup (Wi-Fi MAC, ...)
   ztos-boot-successful     marks the A/B slot successful (no fall back to slot a)
   husky-charge-thermal     throttles charging by battery temperature
+  ztos-waydroid-screen     puts Waydroid's Android to sleep with the screen (KEYCODE_SLEEP/
+                           WAKEUP), so apps stop rendering on the GPU in the pocket
+  60-husky-skin-thermal    makes the kernel's skin-thermal zone (battery thermistor, IPA
+                           on all CPU clusters + GPU, 41 C) proportional-only
   ztos-husky-noc2.conf     cpu8 (X3) C2 off: ACPM hangs otherwise
   60-flatpak-gl.conf       Flatpak apps use the "husky" GL extension (tools/flatpak-gl)
   btaddr: build tools/btaddr.c for aarch64 into usr/local/libexec/btaddr

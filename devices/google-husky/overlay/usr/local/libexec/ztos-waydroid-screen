@@ -1,0 +1,37 @@
+#!/bin/sh
+# Put Waydroid's Android to sleep while the phone's screen is off, and wake it
+# with the screen (Pixel 8 Pro / ztOS).
+#
+# Android inside Waydroid never learns that the panel went dark: its display
+# stays "on", so a foreground app (Instagram's feed, videos) keeps rendering on
+# the GPU, ~3000 GPU job interrupts/s with the screen off, and the phone heats
+# up in the pocket during every awake window.  KEYCODE_SLEEP makes Android do
+# what it does on a real phone: display off, activities paused, SurfaceFlinger
+# idle, while background work and notifications keep running.
+#
+# Screen state is the panel connector's "enabled" (as ztos-autosleep reads it).
+# Only a change of state costs anything: `waydroid shell` is a Python start-up.
+SCREEN=/sys/class/drm/card0-DSI-1/enabled
+last=""
+
+android_up() { pgrep -x surfaceflinger >/dev/null 2>&1; }
+
+send_key() {	# $1 keycode
+	timeout 15 waydroid shell -- input keyevent "$1" >/dev/null 2>&1
+}
+
+while :; do
+	s=$(cat "$SCREEN" 2>/dev/null)
+	# Android booting while the screen is off counts as a change too
+	if android_up; then a=up; else a=down; fi
+	if [ -n "$s" ] && [ "$s:$a" != "$last" ]; then
+		if [ $a = up ]; then
+			case $s in
+			disabled) send_key 223 && echo "screen off: Android asleep" ;;
+			enabled) send_key 224 && echo "screen on: Android awake" ;;
+			esac
+		fi
+		last=$s:$a
+	fi
+	sleep 2
+done
