@@ -1,0 +1,18 @@
+Google Pixel 8 Pro (husky, Tensor G3 "zuma") on a mainline kernel
+(github.com/Noxyntious/linux, branch port/google-husky).
+
+vendor/ztos/manifest.toml  ztOSIAL manifest (zrnperfd CPU ceilings, power limit)
+overlay/                   rootfs files the port adds on top of the ztOS image:
+  ztos-autosleep           suspend-to-RAM while the screen is off; Wi-Fi powered down
+                           through brcmfmac's wlan_power around sleep; stays awake while
+                           audio plays
+  ztos-call-audio          routes call audio through the AoC while a call is up
+  ztos-husky-hw            boot-time hardware setup (Wi-Fi MAC, ...)
+  ztos-boot-successful     marks the A/B slot successful (no fall back to slot a)
+  husky-charge-thermal     throttles charging by battery temperature
+  ztos-husky-noc2.conf     cpu8 (X3) C2 off: ACPM hangs otherwise
+  60-flatpak-gl.conf       Flatpak apps use the "husky" GL extension (tools/flatpak-gl)
+  btaddr: build tools/btaddr.c for aarch64 into usr/local/libexec/btaddr
+tools/                     flatpak-gl (Mesa 26.3 GL extension recipe), green-capture.sh
+                           (display state snapshot, needs mmrd.c + dqedump.sh)
+Not here (proprietary or carrier data): firmware, modem images, ims.db.

@@ -1,0 +1,59 @@
+#!/bin/sh
+# Pixel 8 Pro (husky) bring-up that ztOS does not do by itself; the same steps
+# as the husky debug initramfs (husky/initramfs/init).
+log() { echo "ztos-husky-hw: $*"; }
+
+# Audio: the AOC (firmware authenticated by the GSA), then the CS35L41 speaker
+# amps and the AOC sound card; then the sensors' USF hub on the same AOC.
+audio_up() {
+	for m in aoc snd-soc-cs35l41-spi snd-soc-google-aoc; do
+		modprobe $m || { log "audio: modprobe $m failed"; return 1; }
+		[ $m = aoc ] && sleep 3 || sleep 1
+	done
+	log "audio: $(head -n1 /proc/asound/cards)"
+	modprobe aoc-usf-iio || log "sensors: modprobe aoc-usf-iio failed"
+}
+
+# Wi-Fi MAC and BT address from the bootloader's /chosen/config.
+wifi_ifc() {
+	for n in /sys/class/net/*; do
+		[ "$(basename "$(readlink "$n/device/driver" 2>/dev/null)")" = brcmfmac ] || continue
+		basename "$n"
+		return 0
+	done
+	return 1
+}
+wifi_mac() {
+	mac=$(tr -d '\0' < /proc/device-tree/chosen/config/wlan_mac1 2>/dev/null)
+	[ -n "$mac" ] || return 0
+	# brcmfmac registers wlan0 and udev renames it (wlp1s0), so look the
+	# interface up by driver; waiting for "wlan0" by name timed out every
+	# boot and held NetworkManager (ordered after us) back for 30 s.
+	i=0
+	while ! ifc=$(wifi_ifc) && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done
+	[ -n "$ifc" ] || { log "wifi: no brcmfmac interface"; return 0; }
+	ip link set "$ifc" down 2>/dev/null
+	ip link set "$ifc" address "$mac" && log "wifi: MAC from /chosen/config on $ifc"
+}
+bt_addr() {
+	addr=$(tr -d '\0' < /proc/device-tree/chosen/config/bt_addr 2>/dev/null)
+	[ -n "$addr" ] || return 0
+	i=0
+	while [ ! -e /sys/class/bluetooth/hci0 ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done
+	# wait out the patchram and the post-setup auto power-off (see the initramfs)
+	i=0
+	until /usr/local/libexec/btaddr 0 >/dev/null 2>&1; do
+		i=$((i+1)); [ $i -ge 30 ] && { log "bt: hci0 never registered"; return 1; }
+		sleep 1
+	done
+	sleep 3
+	i=0
+	until out=$(/usr/local/libexec/btaddr 0 "$addr" 2>&1); do
+		i=$((i+1)); [ $i -ge 30 ] && { log "bt: btaddr failed: $out"; return 1; }
+		sleep 1
+	done
+	log "bt: address from /chosen/config ($out)"
+}
+
+audio_up & wifi_mac & bt_addr &
+wait

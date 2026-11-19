@@ -1,0 +1,11 @@
+[Unit]
+Description=Mark the running A/B slot as successfully booted (Pixel devinfo)
+# Like Android, only once the system is really up.
+After=multi-user.target graphical.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/ztos-boot-successful
+
+[Install]
+WantedBy=graphical.target multi-user.target

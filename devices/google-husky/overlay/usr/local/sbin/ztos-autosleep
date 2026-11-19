@@ -1,0 +1,242 @@
+#!/usr/bin/python3
+"""ztos-autosleep - suspend-to-RAM while the screen is off (Pixel 8 Pro / husky).
+
+ztOS has no sleep policy of its own yet: nothing ever writes /sys/power/state.
+This loops the kernel's suspend while the panel is off:
+
+  * screen: the DSI connector's DRM "enabled" state (ztmetro blanks it);
+    sleeping starts GRACE_S after the screen went off;
+  * inhibitors: logind "sleep" block inhibitors (ztos-ial's Sleep1.Inhibit
+    takes those for apps) keep the phone awake;
+  * audio: while anything plays (an ALSA playback device RUNNING, or an
+    uncorked PipeWire stream - which also covers Bluetooth) the phone stays
+    awake, Wi-Fi included, so music and videos go on with the screen off;
+  * Wi-Fi: the BCM4398 cannot stay up across a sleep (the root port cuts its
+    power).  With the kernel's wlan_power switch (brcmfmac, kernel #95+) it is
+    powered down before the first sleep and back up when the screen comes on
+    and the Wi-Fi radio is enabled (~15 s to reconnect).  Older kernels: the
+    old behaviour (radio on = stay awake; radio off = chip off the bus until
+    reboot);
+  * race-free entry: the /sys/power/wakeup_count handshake, so a wakeup event
+    that arrives while we decide (modem data, a key) aborts the attempt
+    instead of being lost;
+  * after every wake userspace gets POST_WAKE_S to act (an SMS, a key press
+    turning the screen on) before the next attempt.
+
+Logs one line per state change to the journal.  Disable with
+`systemctl disable --now ztos-autosleep`.
+"""
+import glob
+import os
+import pwd
+import subprocess
+import sys
+import time
+
+SCREEN = "/sys/class/drm/card0-DSI-1/enabled"
+WIFI_PCI = "/sys/bus/pci/devices/0000:01:00.0"
+WIFI_POWER = WIFI_PCI + "/wlan_power"     # 0 down, 1 up, 2 coming up
+GRACE_S = float(os.environ.get("AUTOSLEEP_GRACE_S", 15))
+POST_WAKE_S = float(os.environ.get("AUTOSLEEP_POST_WAKE_S", 2))
+POLL_S = 1.0
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def rd(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def wr(path, value):
+    try:
+        with open(path, "w") as f:
+            f.write(value)
+        return True
+    except OSError:
+        return False
+
+
+def screen_on():
+    # "enabled"/"disabled"; a missing connector counts as on (never sleep blind)
+    return rd(SCREEN, "enabled") != "disabled"
+
+
+def sleep_inhibited():
+    try:
+        out = subprocess.run(
+            ["busctl", "get-property", "org.freedesktop.login1", "/org/freedesktop/login1",
+             "org.freedesktop.login1.Manager", "BlockInhibited"],
+            capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return "sleep" in out
+
+
+def wifi_radio_on():
+    try:
+        out = subprocess.run(["nmcli", "-t", "radio", "wifi"], capture_output=True,
+                             text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return True     # unknown: be safe, do not touch the chip
+    return out == "enabled"
+
+
+def session_user():
+    """The graphical session's user: the owner of the first /run/user/UID
+    with a PipeWire-Pulse socket."""
+    for path in sorted(glob.glob("/run/user/*/pulse/native")):
+        uid = int(path.split("/")[3])
+        try:
+            return pwd.getpwuid(uid).pw_name, uid
+        except KeyError:
+            continue
+    return None, None
+
+
+def audio_playing():
+    """True while something plays: an ALSA playback PCM running (speakers,
+    earpiece, the call path), or an uncorked PipeWire stream (Bluetooth
+    audio never reaches ALSA)."""
+    for status in glob.glob("/proc/asound/card*/pcm*p/sub*/status"):
+        if "state: RUNNING" in rd(status):
+            return True
+    user, uid = session_user()
+    if not user:
+        return False
+    try:
+        out = subprocess.run(
+            ["runuser", "-u", user, "--", "pactl", "list", "sink-inputs"],
+            env={**os.environ, "XDG_RUNTIME_DIR": f"/run/user/{uid}"},
+            capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return "Corked: no" in out
+
+
+def wifi_power_down():
+    """Before a sleep: dongle down via wlan_power. True when done."""
+    state = rd(WIFI_POWER)
+    if state == "0":
+        return True
+    if state == "2":
+        return False            # firmware still loading: try again shortly
+    log("wifi: powering the BCM4398 down for sleep")
+    return wr(WIFI_POWER, "0") and rd(WIFI_POWER) == "0"
+
+
+def wifi_power_up():
+    """Screen on: bring the dongle back if the radio is wanted."""
+    if not os.path.exists(WIFI_POWER) or rd(WIFI_POWER) != "0":
+        return
+    if not wifi_radio_on():
+        return
+    log("wifi: radio on, powering the BCM4398 up")
+    wr(WIFI_POWER, "1")
+
+
+def wifi_blocks_sleep():
+    """True while sleeping is not allowed because of Wi-Fi."""
+    if not os.path.exists(WIFI_PCI):
+        return False
+    if os.path.exists(WIFI_POWER):
+        return not wifi_power_down()
+    if wifi_radio_on():
+        return True
+    log("wifi: radio off, taking the BCM4398 off the PCI bus for sleep (back after reboot)")
+    wr(WIFI_PCI + "/remove", "1")
+    time.sleep(2)
+    return os.path.exists(WIFI_PCI)
+
+
+def suspend_once():
+    """One handshake + suspend attempt.  Returns 'ok', 'busy' or an errno name."""
+    count = rd("/sys/power/wakeup_count")
+    if not count or not wr("/sys/power/wakeup_count", count):
+        return "busy"           # a wakeup event is in progress
+    if screen_on():
+        return "screen"         # turned on while we were deciding
+    try:
+        fd = os.open("/sys/power/state", os.O_WRONLY)
+        try:
+            os.write(fd, b"mem")
+        finally:
+            os.close(fd)
+    except OSError as e:
+        import errno
+        return errno.errorcode.get(e.errno, str(e.errno))
+    return "ok"
+
+
+def main():
+    if "deep" in rd("/sys/power/mem_sleep"):
+        wr("/sys/power/mem_sleep", "deep")
+    state = None            # last logged state, to log only changes
+    off_since = None
+    sleeps = 0
+    asleep_s = 0.0
+    last_wifi_check = 0.0
+    while True:
+        if screen_on():
+            if off_since is not None and sleeps:
+                log(f"screen on: {sleeps} sleeps, {asleep_s:.0f} s asleep since screen off")
+            if off_since is not None or time.monotonic() - last_wifi_check > 5:
+                # right after the screen comes on, then every 5 s (the radio
+                # may be switched on while the dongle is down)
+                wifi_power_up()
+                last_wifi_check = time.monotonic()
+            off_since, sleeps, asleep_s = None, 0, 0.0
+            state = "screen-on"
+            time.sleep(POLL_S)
+            continue
+        now = time.monotonic()
+        if off_since is None:
+            off_since = now
+            log(f"screen off: sleeping in {GRACE_S:.0f} s")
+        if now - off_since < GRACE_S:
+            time.sleep(POLL_S)
+            continue
+        # Inhibitors first: Wi-Fi only goes down when the phone is really
+        # about to sleep.
+        if sleep_inhibited():
+            if state != "inhibited":
+                log("sleep inhibited by logind inhibitor, staying awake")
+                state = "inhibited"
+            time.sleep(5)
+            continue
+        # Audio before Wi-Fi: a stream over Wi-Fi has to keep its Wi-Fi.
+        if audio_playing():
+            if state != "audio":
+                log("audio playing: staying awake")
+                state = "audio"
+            time.sleep(3)
+            continue
+        if wifi_blocks_sleep():
+            if state != "wifi":
+                log("wifi: not down yet (radio on and old kernel, or firmware still loading), staying awake")
+                state = "wifi"
+            time.sleep(5)
+            continue
+        state = "sleeping"
+        b0 = time.clock_gettime(time.CLOCK_BOOTTIME)
+        m0 = time.clock_gettime(time.CLOCK_MONOTONIC)
+        res = suspend_once()
+        if res == "ok":
+            sleeps += 1
+            asleep_s += (time.clock_gettime(time.CLOCK_BOOTTIME) - b0) - \
+                        (time.clock_gettime(time.CLOCK_MONOTONIC) - m0)
+            time.sleep(POST_WAKE_S)
+        else:
+            time.sleep(0.5 if res in ("busy", "screen") else 1.0)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)

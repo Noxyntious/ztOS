@@ -1,0 +1,9 @@
+Flatpak GL extension "husky": Mesa 26.3 (Panfrost, Mali-G715 / v11) for flatpak runtimes on branch 26.08.
+The stock org.freedesktop.Platform.GL.default 26.08 is Mesa 26.2.5: no v11 -> GTK4 apps fall to lavapipe (CPU).
+Make the tarball on the PC:
+  cd kbuild/mesa/stage/usr && tar -cf mesa263-ext.tar lib/libgallium-26.3.0.so lib/libEGL_mesa.so.0.0.0 \
+     lib/libgbm.so.1.0.0 lib/gbm/dri_gbm.so share/drirc.d
+copy it to the phone's /tmp, run mkglext.sh as root (bundles /usr/lib/libSPIRV-Tools.so + libsensors from the phone).
+Selected by FLATPAK_GL_DRIVERS=husky (/etc/environment + /etc/environment.d/60-flatpak-gl.conf).
+No Vulkan ICD on purpose (PanVK v11 is non-conformant): GTK then uses its GL renderer.
+When the runtime moves to a new branch (27.08), make the extension again under that branch.

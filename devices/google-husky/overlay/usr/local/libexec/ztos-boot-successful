@@ -1,0 +1,73 @@
+#!/usr/bin/python3
+"""ztos-boot-successful - mark the running A/B slot as successfully booted (Pixel devinfo).
+
+The Pixel bootloader decrements a slot's retry count on every boot until the
+OS marks the boot successful; at 0 it stops in fastboot (or falls back to the
+other slot).  Android's boot-control HAL does the marking
+(device/google/gs-common/bootctrl/aidl/BootControl.cpp, markBootSuccessful):
+in the 128-byte devinfo header ("DEVI", version >= 3.3), ab_data at offset 48
+holds one 4-byte record per slot -- retry_count, then flags bit0 unbootable,
+bit1 successful, bit2 active, bit3 fastboot_ok.  ztOS has no such HAL, so
+this sets the same bit.  Only that bit changes; everything else in the header
+(it also carries other bootloader state) is written back untouched, and the
+result is read back and checked.
+"""
+import os
+import struct
+import sys
+
+DEVINFO = "/dev/disk/by-partlabel/devinfo"
+AB_OFS = 48
+SUCCESSFUL = 0x02
+
+
+def log(msg):
+    print(f"ztos-boot-successful: {msg}", flush=True)
+
+
+def current_slot():
+    for path in ("/proc/bootconfig", "/proc/cmdline"):
+        try:
+            text = open(path).read()
+        except OSError:
+            continue
+        for tok in ("androidboot.slot_suffix = \"_", "androidboot.slot_suffix=_"):
+            i = text.find(tok)
+            if i >= 0:
+                return {"a": 0, "b": 1}.get(text[i + len(tok)])
+    return None
+
+
+def main():
+    slot = current_slot()
+    if slot is None:
+        log("no androidboot.slot_suffix, nothing to do")
+        return 0
+    fd = os.open(DEVINFO, os.O_RDWR | os.O_SYNC)
+    try:
+        hdr = bytearray(os.pread(fd, 128, 0))
+        magic, major, minor = struct.unpack_from("<4sHH", hdr, 0)
+        if magic != b"DEVI" or (major << 16 | minor) < 0x00030003:
+            log(f"unexpected devinfo header {magic!r} {major}.{minor}, not touching it")
+            return 1
+        at = AB_OFS + 4 * slot + 1
+        retry, flags = hdr[AB_OFS + 4 * slot], hdr[at]
+        if flags & SUCCESSFUL:
+            log(f"slot {'ab'[slot]} already successful (retry {retry}, flags {flags:#04x})")
+            return 0
+        new = bytearray(hdr)
+        new[at] = flags | SUCCESSFUL
+        os.pwrite(fd, bytes(new), 0)
+        os.fsync(fd)
+        back = os.pread(fd, 128, 0)
+    finally:
+        os.close(fd)
+    if back != bytes(new):
+        log("read-back mismatch after writing devinfo")
+        return 1
+    log(f"slot {'ab'[slot]} marked successful (retry {retry}, flags {flags:#04x} -> {new[at]:#04x})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

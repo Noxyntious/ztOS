@@ -1,0 +1,10 @@
+[Unit]
+Description=Pixel 8 Pro: throttle battery charging by temperature
+
+[Service]
+ExecStart=/usr/local/sbin/husky-charge-thermal
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

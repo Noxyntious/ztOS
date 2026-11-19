@@ -1,0 +1,12 @@
+[Unit]
+Description=ztOS autosleep: suspend-to-RAM while the screen is off (husky)
+After=multi-user.target NetworkManager.service ModemManager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/ztos-autosleep
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

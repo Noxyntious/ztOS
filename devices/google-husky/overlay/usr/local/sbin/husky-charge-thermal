@@ -1,0 +1,48 @@
+#!/bin/sh
+# Throttle battery charging by temperature on the Pixel 8 Pro (husky), the way
+# stock Android's charging stack does.
+#
+# Battery temperature comes from the fuel gauge's thermistor (the kernel sets it
+# up from the vendor calibration). The hottest SoC zone is a backstop: the SoC
+# sits next to the battery and heats it.
+#
+#   battery below 40 C: 1.5 A   40-43 C: 1.0 A   43-46 C: 0.5 A
+#   46 C and up, or SoC 65 C and up: 0.2 A
+#
+# 1 C of hysteresis on the way back up, so the limit does not flap.
+CHG=/sys/class/power_supply/max77759-charger/constant_charge_current_max
+BAT=/sys/class/power_supply/max170xx_battery/temp
+cur=0
+
+soc_hottest() {
+	t=0
+	for z in /sys/class/thermal/thermal_zone*; do
+		case $(cat "$z/type") in *-thermal) ;; *) continue ;; esac
+		v=$(cat "$z/temp" 2>/dev/null) || continue
+		[ "$v" -gt "$t" ] && t=$v
+	done
+	echo $((t / 1000))
+}
+
+limit_for() {	# $1 battery C, $2 SoC C, $3 margin off the battery thresholds
+	if [ "$1" -ge $((46 - $3)) ] || [ "$2" -ge 65 ]; then echo 200000
+	elif [ "$1" -ge $((43 - $3)) ]; then echo 500000
+	elif [ "$1" -ge $((40 - $3)) ]; then echo 1000000
+	else echo 1500000
+	fi
+}
+
+while :; do
+	b=$(( $(cat "$BAT") / 10 ))
+	s=$(soc_hottest)
+	want=$(limit_for "$b" "$s" 0)
+	if [ "$cur" -ne 0 ] && [ "$want" -gt "$cur" ]; then
+		want=$(limit_for "$b" "$s" 1)
+		[ "$want" -lt "$cur" ] && want=$cur
+	fi
+	if [ "$want" -ne "$cur" ] && echo "$want" > "$CHG"; then
+		echo "husky-charge-thermal: battery ${b} C, SoC ${s} C -> charge limit $((want / 1000)) mA"
+		cur=$want
+	fi
+	sleep 10
+done

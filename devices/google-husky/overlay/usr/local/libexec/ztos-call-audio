@@ -1,0 +1,280 @@
+#!/usr/bin/python3
+"""ztos-call-audio - route call audio on the Pixel 8 Pro (husky) while a call is up.
+
+A call's audio never crosses the AP: the modem hands the downlink to the AOC
+and takes the uplink (mic) back from it, both inside the coprocessors.  The
+AP's whole part is to open the AOC's telephony endpoint, PCM device 4 of the
+aoc-audio card, for as long as the call lasts: the driver's prepare puts the
+AOC DSP in telephony mode, starts the modem mic input, binds the modem
+downlink to the speaker sink and powers the amplifiers (sound/soc/google/
+aoc-audio.c, "aoc-voice").  It is opened at the call media format (16 kHz
+mono S16_LE), filled with exactly one buffer of silence -- which starts it:
+prepare alone routes the call in the AOC but the back end (TDM, amplifiers)
+only runs on start, so a prepared-only stream is a silent call -- and then
+never written again.  Nothing consumes its ring, so its pointer never moves:
+a writer that keeps writing waits for room that never comes and ALSA fails
+the write with EIO after one buffer (~1 s).  Restarting aplay on that tore
+the call path down and up every second, heard as the call cutting in and
+out.  The holder is a
+child process (this script with --hold) so a wedged PCM cannot take the
+D-Bus side with it.
+
+The two CS35L41 amplifiers are the earpiece (top, the unprefixed controls)
+and the loudspeaker (bottom, "R ...").  The AOC drives both from one TDM
+frame and sets no call gain of its own, so a call through it is a
+loudspeaker-level signal on both: here the bottom amp is muted and the top one
+turned down to an earpiece level for the call, and both are put back after.
+
+ModemManager publishes the calls (samsung-sit, CS or IMS); this follows their
+State property and holds the endpoint open while any call is dialing,
+ringing out (early media / ringback), active or held.  An incoming call that
+is still ringing is the AP's ringtone, not call audio.
+"""
+import os
+import signal
+import subprocess
+import sys
+
+from gi.repository import Gio, GLib
+try:
+    from gi.repository import GLibUnix
+except ImportError:         # older GLib: the same call lived in GLib
+    GLibUnix = type("GLibUnix", (), {"signal_add": staticmethod(GLib.unix_signal_add)})
+
+MM = "org.freedesktop.ModemManager1"
+MM_PATH = "/org/freedesktop/ModemManager1"
+CALL_IFACE = "org.freedesktop.ModemManager1.Call"
+VOICE_IFACE = "org.freedesktop.ModemManager1.Modem.Voice"
+PROPS_IFACE = "org.freedesktop.DBus.Properties"
+
+# MMCallState
+DIALING, RINGING_OUT, RINGING_IN, ACTIVE, HELD, WAITING, TERMINATED = 1, 2, 3, 4, 5, 6, 7
+AUDIO_STATES = {DIALING, RINGING_OUT, ACTIVE, HELD}
+STATE_NAMES = {0: "unknown", 1: "dialing", 2: "ringing-out", 3: "ringing-in", 4: "active",
+               5: "held", 6: "waiting", 7: "terminated"}
+
+PCM = os.environ.get("CALL_AUDIO_PCM", "hw:0,4")
+# CS35L41 "Digital PCM Volume": 0 = mute, 817 = 0 dB, 0.125 dB per step.
+EARPIECE_AMP = "Digital PCM Volume"
+SPEAKER_AMP = "R Digital PCM Volume"
+EARPIECE_VOL = int(os.environ.get("CALL_AUDIO_EARPIECE_VOL", 657))     # -20 dB
+CARD = os.environ.get("CALL_AUDIO_CARD", "0")
+HOLDER = [sys.executable, os.path.abspath(__file__), "--hold"]
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def hold_pcm():
+    """--hold: open + prepare the telephony PCM and keep it until SIGTERM."""
+    import ctypes
+    asound = ctypes.CDLL("libasound.so.2")
+    pcm = ctypes.c_void_p()
+    err = asound.snd_pcm_open(ctypes.byref(pcm), PCM.encode(), 0, 0)     # PLAYBACK, blocking
+    if err < 0:
+        log(f"hold: open {PCM} failed: {err}")
+        return 1
+    # S16_LE (2), RW_INTERLEAVED (3), 1 ch, 16 kHz, no resampling, 100 ms;
+    # snd_pcm_set_params ends in snd_pcm_prepare, which is what routes the call.
+    err = asound.snd_pcm_set_params(pcm, 2, 3, 1, 16000, 0, 100000)
+    if err < 0:
+        log(f"hold: set_params/prepare {PCM} failed: {err}")
+        asound.snd_pcm_close(pcm)
+        return 1
+    # One full buffer: start_threshold is the buffer size, so this starts it.
+    buf, per = ctypes.c_ulong(), ctypes.c_ulong()
+    asound.snd_pcm_get_params(pcm, ctypes.byref(buf), ctypes.byref(per))
+    zeros = ctypes.create_string_buffer(buf.value * 2)
+    n = asound.snd_pcm_writei(pcm, zeros, ctypes.c_ulong(buf.value))
+    if n < 0:
+        log(f"hold: priming {PCM} failed: {n}")
+    signal.signal(signal.SIGTERM, lambda *_: None)
+    signal.signal(signal.SIGINT, lambda *_: None)
+    signal.pause()
+    asound.snd_pcm_close(pcm)
+    return 0
+
+
+def amp_get(name):
+    try:
+        out = subprocess.run(["amixer", "-c", CARD, "cget", f"name={name}"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith(": values="):
+            try:
+                return int(line.split("=", 1)[1].split(",")[0])
+            except ValueError:
+                return None
+    return None
+
+
+def amp_set(name, value):
+    try:
+        subprocess.run(["amixer", "-q", "-c", CARD, "cset", f"name={name}", str(value)],
+                       timeout=5, check=True)
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"amixer {name}={value} failed: {e}")
+
+
+class CallAudio:
+    def __init__(self, bus):
+        self.bus = bus
+        self.calls = {}         # call object path -> state
+        self.proc = None        # Gio.Subprocess of the PCM holder
+        self.saved = None       # amp volumes before the call
+        self.loop = GLib.MainLoop()
+        bus.signal_subscribe(MM, PROPS_IFACE, "PropertiesChanged", None, CALL_IFACE,
+                             Gio.DBusSignalFlags.MATCH_ARG0_NAMESPACE, self.on_props)
+        bus.signal_subscribe(MM, VOICE_IFACE, "CallAdded", None, None,
+                             Gio.DBusSignalFlags.NONE, self.on_call_added)
+        bus.signal_subscribe(MM, VOICE_IFACE, "CallDeleted", None, None,
+                             Gio.DBusSignalFlags.NONE, self.on_call_deleted)
+        Gio.bus_watch_name_on_connection(bus, MM, Gio.BusNameWatcherFlags.NONE,
+                                         self.on_mm_appeared, self.on_mm_vanished)
+
+    # --- MM state -----------------------------------------------------------
+
+    def call_state(self, path):
+        try:
+            v = self.bus.call_sync(MM, path, PROPS_IFACE, "Get",
+                                   GLib.Variant("(ss)", (CALL_IFACE, "State")),
+                                   GLib.VariantType("(v)"), Gio.DBusCallFlags.NONE, 5000, None)
+            return v.unpack()[0]
+        except GLib.Error:
+            return None
+
+    def rescan(self):
+        """All calls of all modems, from the object manager."""
+        self.calls = {}
+        try:
+            v = self.bus.call_sync(MM, MM_PATH, "org.freedesktop.DBus.ObjectManager",
+                                   "GetManagedObjects", None, None,
+                                   Gio.DBusCallFlags.NONE, 10000, None)
+        except GLib.Error as e:
+            log(f"cannot list modems: {e.message}")
+            return
+        for path, ifaces in v.unpack()[0].items():
+            for call in ifaces.get(VOICE_IFACE, {}).get("Calls", []):
+                st = self.call_state(call)
+                if st is not None:
+                    self.calls[call] = st
+
+    def on_mm_appeared(self, *_):
+        self.rescan()
+        self.update("ModemManager up")
+
+    def on_mm_vanished(self, *_):
+        self.calls = {}
+        self.update("ModemManager gone")
+
+    def on_call_added(self, _c, _s, _p, _i, _sig, params):
+        path = params.unpack()[0]
+        st = self.call_state(path)
+        if st is not None:
+            self.calls[path] = st
+            self.update(f"call {os.path.basename(path)} added ({STATE_NAMES.get(st, st)})")
+
+    def on_call_deleted(self, _c, _s, _p, _i, _sig, params):
+        path = params.unpack()[0]
+        if self.calls.pop(path, None) is not None:
+            self.update(f"call {os.path.basename(path)} deleted")
+
+    def on_props(self, _c, _s, path, _i, _sig, params):
+        iface, changed, _inval = params.unpack()
+        if iface != CALL_IFACE or "State" not in changed:
+            return
+        st = changed["State"]
+        self.calls[path] = st
+        self.update(f"call {os.path.basename(path)} {STATE_NAMES.get(st, st)}")
+
+    # --- the endpoint -------------------------------------------------------
+
+    def running(self):
+        return self.proc is not None
+
+    def update(self, why):
+        want = any(st in AUDIO_STATES for st in self.calls.values())
+        if want and not self.running():
+            log(f"{why}: call audio on ({PCM}, earpiece {EARPIECE_VOL})")
+            self.amps_for_call()
+            try:
+                self.proc = Gio.Subprocess.new(HOLDER, Gio.SubprocessFlags.STDIN_INHERIT)
+            except GLib.Error as e:
+                log(f"cannot start the PCM holder: {e.message}")
+                self.proc = None
+                return
+            self.proc.wait_async(None, self.on_holder_exit, None)
+        elif not want and self.running():
+            log(f"{why}: call audio off")
+            self.stop()
+        else:
+            log(why)
+
+    def amps_for_call(self):
+        if self.saved is None:
+            self.saved = {n: amp_get(n) for n in (EARPIECE_AMP, SPEAKER_AMP)}
+        amp_set(SPEAKER_AMP, 0)
+        amp_set(EARPIECE_AMP, EARPIECE_VOL)
+
+    def amps_restore(self):
+        if self.saved is None:
+            return
+        for name, value in self.saved.items():
+            if value is not None:
+                amp_set(name, value)
+        self.saved = None
+
+    def stop(self):
+        proc, self.proc = self.proc, None
+        if proc is not None:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(None)
+            except GLib.Error:
+                pass
+        self.amps_restore()
+
+    def on_holder_exit(self, proc, result, _data):
+        try:
+            proc.wait_finish(result)
+        except GLib.Error:
+            pass
+        if proc is not self.proc:
+            return
+        self.proc = None
+        if any(st in AUDIO_STATES for st in self.calls.values()):
+            log(f"PCM holder for {PCM} exited ({proc.get_exit_status() if proc.get_if_exited() else 'signal'})"
+                " during a call; retrying in 1 s")
+            GLib.timeout_add_seconds(1, self.retry)
+        else:
+            self.amps_restore()
+
+    def retry(self):
+        self.update("retry")
+        return False
+
+    def run(self):
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            GLibUnix.signal_add(GLib.PRIORITY_HIGH, sig, self.quit)
+        self.loop.run()
+        self.stop()
+
+    def quit(self):
+        self.loop.quit()
+        return False
+
+
+def main():
+    if "--hold" in sys.argv[1:]:
+        return hold_pcm()
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    CallAudio(bus).run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

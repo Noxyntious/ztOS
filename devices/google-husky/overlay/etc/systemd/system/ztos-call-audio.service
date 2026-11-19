@@ -1,0 +1,12 @@
+[Unit]
+Description=Route call audio through the AOC while a call is up (Pixel 8 Pro)
+After=ModemManager.service ztos-husky-hw.service
+Wants=ModemManager.service
+
+[Service]
+ExecStart=/usr/local/libexec/ztos-call-audio
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
