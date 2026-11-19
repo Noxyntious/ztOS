@@ -350,15 +350,34 @@ static const char *phone_name(bool full) {
 	return full ? with_codename : name;
 }
 
-/* "Snapdragon SDM670", from the SoC's own identification */
+/* "Snapdragon SDM670", from the SoC's own identification. soc0/machine is
+ * the board (the DT model, "Google Pixel 8 Pro ..."), not the chip, so the
+ * name is the family and the SoC's id; the marketing name where the id is
+ * one we know (Google's Tensors identify as Samsung Exynos parts). */
 static const char *soc_name(void) {
 	static char soc[80];
+	static const struct { const char *id, *name; } known[] = {
+		{ "GS101", "Google Tensor" },
+		{ "GS201", "Google Tensor G2" },
+		{ "ZUMA", "Google Tensor G3" },
+		{ "ZUMAPRO", "Google Tensor G4" },
+		{ "EXYNOS9810", "Samsung Exynos 9810" },
+	};
 	if (!soc[0]) {
-		char family[32], machine[40];
+		char family[32], soc_id[32];
 		read_sys_file("/sys/devices/soc0/family", family, sizeof(family));
-		read_sys_file("/sys/devices/soc0/machine", machine, sizeof(machine));
-		snprintf(soc, sizeof(soc), "%s%s%s", machine[0] ? family : "Samsung Exynos 9810",
-			machine[0] && family[0] ? " " : "", machine);
+		read_sys_file("/sys/devices/soc0/soc_id", soc_id, sizeof(soc_id));
+		for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
+			if (strcasecmp(soc_id, known[i].id) == 0) {
+				snprintf(soc, sizeof(soc), "%s", known[i].name);
+				return soc;
+			}
+		}
+		if (!family[0] && !soc_id[0]) {
+			snprintf(soc, sizeof(soc), "Samsung Exynos 9810");	/* the S9, no soc0 */
+		} else {
+			snprintf(soc, sizeof(soc), "%s%s%s", family, family[0] && soc_id[0] ? " " : "", soc_id);
+		}
 	}
 	return soc;
 }
