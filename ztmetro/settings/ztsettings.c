@@ -34,6 +34,7 @@
 #include <unistd.h>
 
 #include <cairo.h>
+#include <crypt.h>
 #include <dirent.h>
 #include <glob.h>
 #include <gdk-pixbuf/gdk-pixbuf.h>
@@ -83,6 +84,7 @@ enum page {
 	PAGE_WALLS,	/* the background photo picker: categories, then one */
 	PAGE_NAVIGATION,
 	PAGE_BOOST,	/* Dynamic Boost System: RapidBoost and IntelligentBoost */
+	PAGE_LOCK,	/* lock screen: the PIN */
 };
 
 enum action {
@@ -165,6 +167,10 @@ enum action {
 	ACT_APN_AUTH,
 	ACT_APN_SAVE,
 	ACT_ABOUT_REPO,
+	ACT_LOCK_PIN,		/* arg: 1 set or change, 2 remove */
+	ACT_LOCK_KEY,		/* arg: the pad's key, 0..8 digits 1..9, 10 the 0, 11 backspace */
+	ACT_LOCK_NEXT,
+	ACT_LOCK_CANCEL,
 	ACT_IB_MODE,		/* arg: 0 off, 1 shadow, 2 on */
 	ACT_IB_ENGINE,		/* arg: 0 the processor, 1 SCORE */
 	ACT_QUICK_SLOT,		/* then one for each of the eight places */
@@ -1064,6 +1070,8 @@ static void cell_load(void) {
 
 static int brightness_now(void);
 
+static bool lockpin_read(int *len, char *hash, size_t size);
+
 static double draw_main(cairo_t *cr) {
 	double y = zmc_pivot_next(cr, "system", "applications", ACT_OPEN_PAGE, PAGE_APPS);
 	char detail[128], wifi[96];
@@ -1072,6 +1080,12 @@ static double draw_main(cairo_t *cr) {
 		ACCENTS[app.accent].name, app.columns);
 	y = zmc_entry(cr, y, "theme", detail, ACT_OPEN_PAGE, PAGE_THEME);
 	y = zmc_entry(cr, y, "navigation bar", "choose the centre icon", ACT_OPEN_PAGE, PAGE_NAVIGATION);
+	{
+		int pin_len = 0;
+		if (lockpin_read(&pin_len, NULL, 0)) snprintf(detail, sizeof(detail), "password on, %d digits", pin_len);
+		else snprintf(detail, sizeof(detail), "no password");
+		y = zmc_entry(cr, y, "lock screen", detail, ACT_OPEN_PAGE, PAGE_LOCK);
+	}
 
 	/* the screen's real level: the config's is only where it last started,
 	 * and auto brightness moves on from it */
@@ -3152,6 +3166,220 @@ static double draw_perf(cairo_t *cr) {
 	return y + 20;
 }
 
+
+/* ---- lock screen: the PIN that ztmetro's pad asks for after the swipe ----
+ * ~/.config/ztmetro/lockpin holds "<digits> <crypt(3) hash>" (yescrypt, a new
+ * salt each time), mode 0600, never the PIN; ztmetro rereads it on SIGHUP.
+ * Changing or removing it takes the current one first. The digits come from
+ * a pad on the page, as Windows Phone's own settings had: the keyboard has no
+ * number layout of its own. */
+enum { LP_IDLE, LP_CURRENT, LP_NEW, LP_CONFIRM };
+static int lp_step, lp_goal;
+static char lp_box[17], lp_new[17], lp_note[96];
+
+static void lockpin_path(char *path, size_t size) {
+	const char *home = getenv("HOME");
+	snprintf(path, size, "%s/.config/ztmetro/lockpin", home ? home : "");
+}
+
+static bool lockpin_read(int *len, char *hash, size_t size) {
+	char path[512], line[320], h[256];
+	lockpin_path(path, sizeof(path));
+	FILE *f = fopen(path, "r");
+	int n = 0;
+	bool ok = f && fgets(line, sizeof(line), f) && sscanf(line, "%d %255s", &n, h) == 2 &&
+		n >= 4 && n <= 16 && h[0] == '$';
+	if (f) fclose(f);
+	if (ok) {
+		if (len) *len = n;
+		if (hash) snprintf(hash, size, "%s", h);
+	}
+	return ok;
+}
+
+static bool lockpin_matches(const char *pin) {
+	char hash[256];
+	if (!lockpin_read(NULL, hash, sizeof(hash))) return false;
+	struct crypt_data *cd = calloc(1, sizeof(*cd));
+	const char *h = cd ? crypt_r(pin, hash, cd) : NULL;
+	bool ok = h && h[0] == '$' && strcmp(h, hash) == 0;
+	if (cd) {
+		explicit_bzero(cd, sizeof(*cd));
+		free(cd);
+	}
+	return ok;
+}
+
+static void lockpin_tell_shell(void) {
+	if (system("pkill -HUP -x ztmetro 2>/dev/null") != 0) {}
+}
+
+static bool lockpin_write(const char *pin) {
+	char salt[128], path[512], tmp[520];
+	if (!crypt_gensalt_rn("$y$", 0, NULL, 0, salt, sizeof(salt))) return false;
+	struct crypt_data *cd = calloc(1, sizeof(*cd));
+	const char *h = cd ? crypt_r(pin, salt, cd) : NULL;
+	bool ok = h && h[0] == '$';
+	if (ok) {
+		lockpin_path(path, sizeof(path));
+		snprintf(tmp, sizeof(tmp), "%s.new", path);
+		int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+		FILE *f = fd >= 0 ? fdopen(fd, "w") : NULL;
+		ok = f && fprintf(f, "%zu %s\n", strlen(pin), h) > 0;
+		if (f) {
+			ok = fflush(f) == 0 && fsync(fileno(f)) == 0 && ok;
+			fclose(f);
+		} else if (fd >= 0) {
+			close(fd);
+		}
+		ok = ok && rename(tmp, path) == 0;
+		if (!ok) unlink(tmp);
+	}
+	if (cd) {
+		explicit_bzero(cd, sizeof(*cd));
+		free(cd);
+	}
+	if (ok) lockpin_tell_shell();
+	return ok;
+}
+
+static void lp_finish(const char *note) {
+	explicit_bzero(lp_box, sizeof(lp_box));
+	explicit_bzero(lp_new, sizeof(lp_new));
+	lp_step = LP_IDLE;
+	snprintf(lp_note, sizeof(lp_note), "%s", note);
+}
+
+static void lp_advance(void) {
+	size_t n = strlen(lp_box);
+	lp_note[0] = 0;
+	if (lp_step == LP_CURRENT) {
+		bool right = lockpin_matches(lp_box);
+		explicit_bzero(lp_box, sizeof(lp_box));
+		if (!right) {
+			snprintf(lp_note, sizeof(lp_note), "that isn't the current password");
+			return;
+		}
+		if (lp_goal == 2) {
+			char path[512];
+			lockpin_path(path, sizeof(path));
+			unlink(path);
+			lockpin_tell_shell();
+			lp_finish("password removed: a swipe unlocks");
+			return;
+		}
+		lp_step = LP_NEW;
+	} else if (lp_step == LP_NEW) {
+		if (n < 4) {
+			snprintf(lp_note, sizeof(lp_note), "at least 4 digits");
+			return;
+		}
+		snprintf(lp_new, sizeof(lp_new), "%s", lp_box);
+		explicit_bzero(lp_box, sizeof(lp_box));
+		lp_step = LP_CONFIRM;
+	} else if (lp_step == LP_CONFIRM) {
+		bool same = strcmp(lp_box, lp_new) == 0;
+		explicit_bzero(lp_box, sizeof(lp_box));
+		if (!same) {
+			explicit_bzero(lp_new, sizeof(lp_new));
+			lp_step = LP_NEW;
+			snprintf(lp_note, sizeof(lp_note), "the two didn't match: type a new one again");
+			return;
+		}
+		lp_finish(lockpin_write(lp_new) ? "password set" : "couldn't save the password");
+	}
+}
+
+static void lp_key(int k) {
+	size_t n = strlen(lp_box);
+	lp_note[0] = 0;
+	if ((k < 9 || k == 10) && n + 1 < sizeof(lp_box)) {
+		lp_box[n] = k == 10 ? '0' : (char)('1' + k);
+		lp_box[n + 1] = 0;
+	} else if (k == 11 && n) {
+		lp_box[n - 1] = 0;
+	}
+}
+
+static double draw_lockscreen(cairo_t *cr) {
+	double y = zmc_header(cr, "lock screen");
+	int len = 0;
+	bool on = lockpin_read(&len, NULL, 0);
+	char detail[128];
+	if (lp_step == LP_IDLE) {
+		if (on) snprintf(detail, sizeof(detail), "on, %d digits", len);
+		else snprintf(detail, sizeof(detail), "off: a swipe unlocks the phone");
+		y = zmc_field(cr, y, "Password", detail);
+		if (on) {
+			y = zmc_entry(cr, y, "change password", "type the current one, then a new one", ACT_LOCK_PIN, 1);
+			y = zmc_entry(cr, y, "remove password", "unlock with a swipe again", ACT_LOCK_PIN, 2);
+		} else {
+			y = zmc_entry(cr, y, "set a password", "4 to 16 digits, asked after the unlock swipe",
+				ACT_LOCK_PIN, 1);
+		}
+		if (lp_note[0]) {
+			cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+			y += zmc_text(cr, lp_note, FONT_REGULAR, 14, MARGIN, y + 6, zmc.width - 2 * MARGIN) + 12;
+		}
+		return y + 20;
+	}
+
+	static const char *const captions[] = { "", "current password", "new password, 4 to 16 digits",
+		"new password again" };
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	zmc_text(cr, captions[lp_step], FONT_REGULAR, 14, MARGIN, y, 0);
+	y += 26;
+	/* the dots, in a box as the text boxes have it */
+	double w = zmc.width - 2 * MARGIN;
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	cairo_rectangle(cr, MARGIN, y, w, 40);
+	cairo_fill(cr);
+	char dots[96] = "";
+	for (size_t i = 0; lp_box[i]; i++) strcat(dots, "● ");
+	cairo_set_source_rgb(cr, 0, 0, 0);
+	zmc_text(cr, dots, FONT_REGULAR, 17, MARGIN + 10, y + 9, 0);
+	y += 48;
+	if (lp_note[0]) {
+		cairo_set_source_rgb(cr, 1, 0.5, 0.5);
+		y += zmc_text(cr, lp_note, FONT_REGULAR, 14, MARGIN, y, w) + 6;
+	}
+	/* the pad: the lock screen's keys, smaller */
+	double gap = 6, kw = (w - 2 * gap) / 3, kh = 50;
+	for (int k = 0; k < 12; k++) {
+		if (k == 9) continue;
+		double kx = MARGIN + (k % 3) * (kw + gap), ky = y + (k / 3) * (kh + gap);
+		cairo_set_source_rgb(cr, 0x47 / 255.0, 0x47 / 255.0, 0x47 / 255.0);
+		cairo_rectangle(cr, kx, ky, kw, kh);
+		cairo_fill(cr);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		if (k == 11) {
+			double cx = kx + kw / 2, cy = ky + kh / 2, h = 10, hw = 15;
+			cairo_set_line_width(cr, 1.8);
+			cairo_move_to(cr, cx - hw, cy);
+			cairo_line_to(cr, cx - hw + h, cy - h);
+			cairo_line_to(cr, cx + hw, cy - h);
+			cairo_line_to(cr, cx + hw, cy + h);
+			cairo_line_to(cr, cx - hw + h, cy + h);
+			cairo_close_path(cr);
+			cairo_move_to(cr, cx - 2, cy - 4.5);
+			cairo_line_to(cr, cx + 7, cy + 4.5);
+			cairo_move_to(cr, cx + 7, cy - 4.5);
+			cairo_line_to(cr, cx - 2, cy + 4.5);
+			cairo_stroke(cr);
+		} else {
+			char digit[2] = { k == 10 ? '0' : (char)('1' + k), 0 };
+			zmc_text(cr, digit, FONT_SEMILIGHT, 26, kx + kw / 2 - 7, ky + 9, 0);
+		}
+		zmc_add_hit(kx, ky, kw, kh, ACT_LOCK_KEY, k);
+	}
+	y += 4 * (kh + gap) + 8;
+	bool last = lp_step == LP_CONFIRM || (lp_step == LP_CURRENT && lp_goal == 2);
+	y = zmc_entry(cr, y, last ? "done" : "next", lp_step == LP_CURRENT ? "check the current password" :
+		lp_step == LP_NEW ? "then type it once more" : "save the new password", ACT_LOCK_NEXT, 0);
+	y = zmc_entry(cr, y, "cancel", "leave the password as it is", ACT_LOCK_CANCEL, 0);
+	return y + 20;
+}
+
 static double draw_dev(cairo_t *cr) {
 	double y = zmc_header(cr, "developer tests");
 	y = zmc_switch(cr, y, "Demo tiles on Start", app.dev_demo_tiles, ACT_DEV_DEMO_TILES);
@@ -3175,6 +3403,7 @@ static double render_page_content(cairo_t *cr, int p) {
 	case PAGE_PERF: return draw_perf(cr);
 	case PAGE_BOOST: return draw_boost(cr);
 	case PAGE_DEV: return draw_dev(cr);
+	case PAGE_LOCK: return draw_lockscreen(cr);
 	case PAGE_MAIN: return draw_main(cr);
 	case PAGE_APPS: return draw_apps(cr);
 	case PAGE_INSTALLED_APPS: return draw_installed_apps(cr);
@@ -3291,6 +3520,20 @@ static void activate(int action, int arg) {
 		break;
 	case ACT_ABOUT_REPO:
 		app.about_show_repo = !app.about_show_repo;
+		break;
+	case ACT_LOCK_PIN:
+		lp_goal = arg;
+		lp_finish("");
+		lp_step = lockpin_read(NULL, NULL, 0) ? LP_CURRENT : LP_NEW;
+		break;
+	case ACT_LOCK_KEY:
+		lp_key(arg);
+		break;
+	case ACT_LOCK_NEXT:
+		lp_advance();
+		break;
+	case ACT_LOCK_CANCEL:
+		lp_finish("");
 		break;
 	case ACT_HAPTIC_TRY: {
 		static const char *const pulses[] = { "tick system", "tap system", "click system", "heavy system" };
@@ -4038,6 +4281,11 @@ static bool back(void) {
 		return true;
 	}
 	if (zmc.page == PAGE_DATE) { date_focus = -1; zmc_keyboard(false); }
+	if (zmc.page == PAGE_LOCK && lp_step != LP_IDLE) {
+		lp_finish("");	/* back leaves the password dialogue first */
+		zmc_redraw();
+		return true;
+	}
 	if (zmc.page == PAGE_APN) {
 		apn_focus = -1;
 		zmc_keyboard(false);
@@ -4113,7 +4361,7 @@ static const struct { const char *name; enum page page; } pages[] = {
 	{ "wifi", PAGE_WIFI }, { "bluetooth", PAGE_BLUETOOTH }, { "mobile", PAGE_MOBILE }, { "audio", PAGE_AUDIO },
 	{ "battery", PAGE_BATTERY }, { "cpu", PAGE_CPU }, { "vm", PAGE_VM },
 	{ "gpu", PAGE_GPU }, { "keyboard", PAGE_KEYBOARD }, { "about", PAGE_ABOUT },
-	{ "perf", PAGE_PERF }, { "boost", PAGE_BOOST }, { "dev", PAGE_DEV }, { "haptics", PAGE_HAPTICS }, { "quick", PAGE_QUICK }, { "apn", PAGE_APN }, { "wifijoin", PAGE_WIFI_JOIN }, { "wifinet", PAGE_WIFI_NET },
+	{ "perf", PAGE_PERF }, { "boost", PAGE_BOOST }, { "dev", PAGE_DEV }, { "haptics", PAGE_HAPTICS }, { "quick", PAGE_QUICK }, { "apn", PAGE_APN }, { "wifijoin", PAGE_WIFI_JOIN }, { "wifinet", PAGE_WIFI_NET }, { "lock", PAGE_LOCK },
 };
 
 static int page_named(const char *name) {
@@ -4149,6 +4397,10 @@ int main(int argc, char **argv) {
 		/* ZT_OPEN_PICKER=ACTION draws that list picker open, for reviews */
 		if (getenv("ZT_OPEN_PICKER")) {
 			open_picker = atoi(getenv("ZT_OPEN_PICKER"));
+		}
+		if (getenv("ZT_LOCK_STEP")) {	/* the lock page's PIN dialogue: 1..3 */
+			lp_step = atoi(getenv("ZT_LOCK_STEP"));
+			snprintf(lp_box, sizeof(lp_box), "12");
 		}
 		if (getenv("ZT_ABOUT_REPO")) {
 			app.about_show_repo = true;

@@ -44,6 +44,7 @@
 #include <stdatomic.h>
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
+#include <crypt.h>
 #include <sys/wait.h>
 #include <math.h>
 #include <signal.h>
@@ -445,6 +446,7 @@ enum touch_role {
 	ROLE_CLOSE,	/* started at the left edge over an app */
 	ROLE_NAV,	/* on the nav bar */
 	ROLE_LOCK,	/* on the lock screen */
+	ROLE_PIN,	/* on the lock screen's PIN pad */
 	ROLE_SWITCH,	/* among the app switcher's cards */
 	ROLE_KEY,	/* on the keyboard */
 	ROLE_CURSOR,	/* holding the keyboard cursor dot */
@@ -586,6 +588,21 @@ struct zt_server {
 	cairo_surface_t *lock_wall;
 	bool locked;
 	bool call_over_lock;	/* only the phone call may cover the lock */
+	/* The lock screen's PIN (Settings > lock screen): the unlock swipe opens
+	 * Windows Phone 8.1's pad instead of unlocking. ~/.config/ztmetro/lockpin
+	 * holds "<digits> <crypt hash>", never the PIN. */
+	bool pin_set, pin_open;
+	int pin_len;
+	char pin_hash[256];
+	char pin_entry[17];
+	int pin_pressed;		/* the key under the finger, -1 none */
+	int pin_fails;
+	uint32_t pin_wait_until;	/* after too many wrong ones: no tries until then */
+	bool pin_emergency;		/* the pad dials, emergency numbers only */
+	char pin_dial[17];
+	char pin_msg[64];
+	struct wl_event_source *pin_timer;
+	bool pin_layer;			/* the lock layer holds the pad (it slides up with it) */
 	/* app switcher: the apps as a row of cards, newest on the right */
 	bool switcher;
 	float switch_t;			/* 0 the app at full size, 1 cards */
@@ -2992,6 +3009,8 @@ static void backlight_manual(void) {
 	pipe_tell("/run/ztoscsf-sensord.ctl", "auto off\n");
 }
 
+static void pin_load(struct zt_server *server);
+
 static void load_config(struct zt_server *server) {
 	char path[512];
 	const char *home = getenv("HOME");
@@ -3029,6 +3048,7 @@ static void load_config(struct zt_server *server) {
 	server->dm_palette = 0;
 	server->dm_amoled = false;
 	server->dm_cfg = (struct dm_config){ .launch_delay = 800, .sys_stats = true, .event_banners = true };
+	pin_load(server);	/* its own file: the config is readable by every app */
 	FILE *f = fopen(path, "r");
 	if (!f) {
 		return;
@@ -6026,7 +6046,14 @@ static void lock_notes_changed(struct zt_server *server) {
 	damage(server);
 }
 
+static void draw_pin(struct zt_server *server);
+
 static void draw_lock(struct zt_server *server) {
+	if (server->pin_open) {
+		draw_pin(server);
+		return;
+	}
+	server->pin_layer = false;
 	cairo_t *cr;
 	struct zt_buffer *buffer = zt_buffer_create(server, server->width, server->height, &cr);
 	if (retro_on(server)) {
@@ -6092,10 +6119,344 @@ static void ui_sound(struct zt_server *server, enum ui_sound sound) {
 	sendto(server->key_sound_fd, packet, sizeof(packet), MSG_DONTWAIT, (struct sockaddr *)&addr, sizeof(addr));
 }
 
-static void lock(struct zt_server *server) {
-	if (server->width == 0 || !server->lock_enabled) {
+
+/* ---- The lock screen's PIN pad, as Windows Phone 8.1 has it ----
+ *
+ * Set in Settings > lock screen (ztsettings writes ~/.config/ztmetro/lockpin,
+ * "<number of digits> <crypt(3) hash>", mode 0600, and sends SIGHUP). With a
+ * PIN, the unlock swipe brings the pad up instead of Start: the photo above,
+ * "enter your password" and the 4 x 3 keys below, "emergency call" at the
+ * foot. The PIN is checked as soon as it has its number of digits. Five wrong
+ * ones in a row and the pad waits 30 s, doubling after each further miss.
+ *
+ * "emergency call" turns the same keys into a dialer that places a call only
+ * to an emergency number, through ztphone --call; ztoscorenetworkingd then
+ * shows the call screen over the lock as for any call.
+ *
+ * The pad is drawn into the lock layer itself (pin_layer says so), so the
+ * render path that keeps whatever is under the lock out of sight covers it
+ * too. Geometry: the 480 x 800 Lumia screen, scaled to our width, sat on the
+ * bottom of the screen. */
+#define PIN_TRIES	5
+#define PIN_WAIT_MS	30000
+
+static const char *const pin_emergency_numbers[] = {
+	"112", "911", "999", "000", "08", "110", "118", "119", "100", "101", "102", "103",
+	"150", "155", "156", "158", NULL
+};
+
+static bool pin_is_emergency(const char *number) {
+	for (int i = 0; pin_emergency_numbers[i]; i++) {
+		if (strcmp(number, pin_emergency_numbers[i]) == 0) return true;
+	}
+	return false;
+}
+
+static void pin_load(struct zt_server *server) {
+	char path[512], line[320], hash[256];
+	const char *home = getenv("HOME");
+	snprintf(path, sizeof(path), "%s/.config/ztmetro/lockpin", home ? home : "");
+	server->pin_set = false;
+	server->pin_len = 0;
+	server->pin_hash[0] = 0;
+	FILE *f = fopen(path, "r");
+	if (!f) return;
+	int len = 0;
+	if (fgets(line, sizeof(line), f) && sscanf(line, "%d %255s", &len, hash) == 2 &&
+			len >= 4 && len <= 16 && hash[0] == '$') {
+		server->pin_len = len;
+		snprintf(server->pin_hash, sizeof(server->pin_hash), "%s", hash);
+		server->pin_set = true;
+	}
+	fclose(f);
+}
+
+struct pin_geo {
+	double s, top, key_w, key_h, key_x[3], row_y[4], btn_y, btn_w, btn_h, btn_x[2];
+};
+
+static void pin_geometry(struct zt_server *server, struct pin_geo *g) {
+	double s = server->width / 480.0;
+	g->s = s;
+	g->top = server->height - 500 * s;
+	g->key_w = (server->width - 20 * s) / 3.0;	/* 4 in from the sides, 6 between */
+	g->key_h = 78 * s;
+	for (int c = 0; c < 3; c++) g->key_x[c] = 4 * s + c * (g->key_w + 6 * s);
+	for (int r = 0; r < 4; r++) g->row_y[r] = g->top + 88 * s + r * (g->key_h + 6 * s);
+	g->btn_y = g->top + 433 * s;
+	g->btn_w = 204 * s;
+	g->btn_h = 47 * s;
+	g->btn_x[0] = 24 * s;
+	g->btn_x[1] = server->width - 24 * s - g->btn_w;
+}
+
+/* 0..8 the digits 1..9, 9 the blank key, 10 the 0, 11 backspace, 12 the
+ * button at the foot (emergency call, or call), 13 cancel (dialer only) */
+static int pin_hit(struct zt_server *server, double x, double y) {
+	struct pin_geo g;
+	pin_geometry(server, &g);
+	for (int r = 0; r < 4; r++) {
+		for (int c = 0; c < 3; c++) {
+			if (x >= g.key_x[c] && x < g.key_x[c] + g.key_w &&
+					y >= g.row_y[r] && y < g.row_y[r] + g.key_h) {
+				return r * 3 + c;
+			}
+		}
+	}
+	for (int b = 0; b < (server->pin_emergency ? 2 : 1); b++) {
+		if (x >= g.btn_x[b] - 8 && x < g.btn_x[b] + g.btn_w + 8 &&
+				y >= g.btn_y - 8 && y < g.btn_y + g.btn_h + 8) {
+			return 12 + b;
+		}
+	}
+	return -1;
+}
+
+static void pin_button(struct zt_server *server, cairo_t *cr, const struct pin_geo *g, int b,
+		const char *label, bool enabled) {
+	double x = g->btn_x[b], y = g->btn_y, w = g->btn_w, h = g->btn_h, lw = 2.5 * g->s;
+	bool down = server->pin_pressed == 12 + b && enabled;
+	if (down) {
+		set_rgb(cr, server->accent);
+		cairo_rectangle(cr, x, y, w, h);
+		cairo_fill(cr);
+	}
+	if (enabled) cairo_set_source_rgb(cr, 1, 1, 1);
+	else cairo_set_source_rgb(cr, 0.4, 0.4, 0.4);
+	cairo_set_line_width(cr, lw);
+	cairo_rectangle(cr, x + lw / 2, y + lw / 2, w - lw, h - lw);
+	cairo_stroke(cr);
+	draw_text(cr, label, FONT_REGULAR, 21 * g->s, x, y, w, h, true);
+}
+
+static void draw_pin(struct zt_server *server) {
+	struct pin_geo g;
+	pin_geometry(server, &g);
+	double s = g.s;
+	cairo_t *cr;
+	struct zt_buffer *buffer = zt_buffer_create(server, server->width, server->height, &cr);
+	cairo_set_source_rgb(cr, 0, 0, 0);
+	cairo_paint(cr);
+	if (server->lock_wall) {
+		cairo_save(cr);
+		cairo_scale(cr, 1.0 / server->scale, 1.0 / server->scale);
+		cairo_set_source_surface(cr, server->lock_wall, 0, 0);
+		cairo_paint(cr);
+		cairo_restore(cr);
+	}
+	status_row(server, cr, false, false);
+	cairo_set_source_rgb(cr, 0x1f / 255.0, 0x1f / 255.0, 0x1f / 255.0);
+	cairo_rectangle(cr, 0, g.top, server->width, server->height - g.top);
+	cairo_fill(cr);
+
+	/* the line over the keys: what to do, what went wrong, or the dots */
+	char line[96];
+	const char *font = FONT_REGULAR;
+	double size = 26 * s;
+	if (server->pin_emergency) {
+		if (server->pin_dial[0]) {
+			snprintf(line, sizeof(line), "%s", server->pin_dial);
+			font = FONT_SEMILIGHT;
+			size = 34 * s;
+		} else {
+			snprintf(line, sizeof(line), "emergency calls only");
+		}
+	} else if (server->pin_msg[0]) {
+		snprintf(line, sizeof(line), "%s", server->pin_msg);
+	} else if (server->pin_entry[0]) {
+		line[0] = 0;
+		for (size_t i = 0; server->pin_entry[i] && strlen(line) + 8 < sizeof(line); i++) {
+			strcat(line, i ? " ●" : "●");
+		}
+		size = 22 * s;
+	} else {
+		snprintf(line, sizeof(line), "enter your password");
+	}
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	draw_text(cr, line, font, size, 0, g.top + 14 * s, server->width, 56 * s, true);
+
+	/* the keys */
+	for (int k = 0; k < 12; k++) {
+		int r = k / 3, c = k % 3;
+		double x = g.key_x[c], y = g.row_y[r];
+		if (server->pin_pressed == k && k != 9) set_rgb(cr, server->accent);
+		else cairo_set_source_rgb(cr, 0x47 / 255.0, 0x47 / 255.0, 0x47 / 255.0);
+		cairo_rectangle(cr, x, y, g.key_w, g.key_h);
+		cairo_fill(cr);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		if (k < 9 || k == 10) {
+			char digit[2] = { k == 10 ? '0' : (char)('1' + k), 0 };
+			draw_text(cr, digit, FONT_SEMILIGHT, 40 * s, x, y, g.key_w, g.key_h, true);
+		} else if (k == 11) {
+			/* the backspace: a tag pointing left, a cross in it */
+			double cx = x + g.key_w / 2, cy = y + g.key_h / 2, h = 15 * s, w = 22 * s;
+			cairo_set_line_width(cr, 2.2 * s);
+			cairo_set_line_join(cr, CAIRO_LINE_JOIN_MITER);
+			cairo_move_to(cr, cx - w, cy);
+			cairo_line_to(cr, cx - w + h, cy - h);
+			cairo_line_to(cr, cx + w, cy - h);
+			cairo_line_to(cr, cx + w, cy + h);
+			cairo_line_to(cr, cx - w + h, cy + h);
+			cairo_close_path(cr);
+			cairo_stroke(cr);
+			double xc = cx + 4 * s, d = 6.5 * s;
+			cairo_move_to(cr, xc - d, cy - d);
+			cairo_line_to(cr, xc + d, cy + d);
+			cairo_move_to(cr, xc + d, cy - d);
+			cairo_line_to(cr, xc - d, cy + d);
+			cairo_stroke(cr);
+		}
+	}
+
+	if (server->pin_emergency) {
+		pin_button(server, cr, &g, 0, "call", pin_is_emergency(server->pin_dial));
+		pin_button(server, cr, &g, 1, "cancel", true);
+	} else {
+		pin_button(server, cr, &g, 0, "emergency call", true);
+	}
+	server->pin_layer = true;
+	zt_buffer_show(server, &server->lock_layer, buffer, cr, server->width, server->height);
+}
+
+static void unlock_now(struct zt_server *server);
+
+static void pin_reset(struct zt_server *server) {
+	server->pin_open = false;
+	server->pin_emergency = false;
+	explicit_bzero(server->pin_entry, sizeof(server->pin_entry));
+	server->pin_dial[0] = 0;
+	server->pin_msg[0] = 0;
+	server->pin_pressed = -1;
+}
+
+/* the pad's line again: a lockout counting down, or a message going away */
+static int pin_tick(void *data) {
+	struct zt_server *server = data;
+	uint32_t now = now_ms();
+	if (server->pin_wait_until && (int32_t)(server->pin_wait_until - now) > 0) {
+		snprintf(server->pin_msg, sizeof(server->pin_msg), "try again in %u seconds",
+			(unsigned)((server->pin_wait_until - now + 999) / 1000));
+		wl_event_source_timer_update(server->pin_timer, 1000);
+	} else {
+		server->pin_wait_until = 0;
+		server->pin_msg[0] = 0;
+	}
+	if (server->pin_open) {
+		draw_pin(server);
+		damage(server);
+	}
+	return 0;
+}
+
+static void pin_check(struct zt_server *server) {
+	struct crypt_data *cd = calloc(1, sizeof(*cd));
+	const char *h = cd ? crypt_r(server->pin_entry, server->pin_hash, cd) : NULL;
+	bool ok = h && h[0] == '$' && strcmp(h, server->pin_hash) == 0;
+	if (cd) {
+		explicit_bzero(cd, sizeof(*cd));
+		free(cd);
+	}
+	explicit_bzero(server->pin_entry, sizeof(server->pin_entry));
+	if (ok) {
+		server->pin_fails = 0;
+		server->pin_wait_until = 0;
+		pin_reset(server);
+		unlock_now(server);
 		return;
 	}
+	server->pin_fails++;
+	hap(server, HAP_HEAVY, HG_SYSTEM);
+	wlr_log(WLR_INFO, "lock: wrong PIN (%d in a row)", server->pin_fails);
+	if (server->pin_fails >= PIN_TRIES) {
+		int extra = server->pin_fails - PIN_TRIES;
+		uint32_t wait = (uint32_t)PIN_WAIT_MS << (extra > 5 ? 5 : extra);
+		server->pin_wait_until = (now_ms() + wait) | 1;
+		pin_tick(server);
+	} else {
+		snprintf(server->pin_msg, sizeof(server->pin_msg), "incorrect password, try again");
+		wl_event_source_timer_update(server->pin_timer, 2500);
+	}
+}
+
+static void pin_open_pad(struct zt_server *server) {
+	pin_reset(server);
+	server->pin_open = true;
+	animate(server, &server->lock_y, 0.0f, 1, 0, true);
+	server->lock_y = 0.0f;
+	if (server->pin_wait_until) pin_tick(server);	/* still waiting out the last misses */
+	draw_pin(server);
+	damage(server);
+	wlr_log(WLR_INFO, "lock: PIN pad");
+}
+
+static void pin_key(struct zt_server *server, int k) {
+	if (server->pin_emergency) {
+		size_t n = strlen(server->pin_dial);
+		if ((k < 9 || k == 10) && n + 1 < sizeof(server->pin_dial)) {
+			server->pin_dial[n] = k == 10 ? '0' : (char)('1' + k);
+			server->pin_dial[n + 1] = 0;
+			hap(server, HAP_KEY, HG_KEYS);
+		} else if (k == 11) {
+			if (n) server->pin_dial[n - 1] = 0;
+			hap(server, HAP_KEY, HG_KEYS);
+		} else if (k == 12) {
+			if (!pin_is_emergency(server->pin_dial)) {
+				hap(server, HAP_HEAVY, HG_SYSTEM);
+				return;
+			}
+			hap(server, HAP_TAP, HG_SYSTEM);
+			wlr_log(WLR_INFO, "lock: emergency call to %s", server->pin_dial);
+			run_detached("ztphone", "--call", server->pin_dial, NULL);
+			pin_reset(server);
+			draw_lock(server);
+			damage(server);
+			return;
+		} else if (k == 13) {
+			server->pin_emergency = false;
+			server->pin_dial[0] = 0;
+			hap(server, HAP_TAP, HG_SYSTEM);
+		}
+		draw_pin(server);
+		damage(server);
+		return;
+	}
+	if (k == 12) {
+		server->pin_emergency = true;
+		server->pin_dial[0] = 0;
+		explicit_bzero(server->pin_entry, sizeof(server->pin_entry));
+		hap(server, HAP_TAP, HG_SYSTEM);
+		draw_pin(server);
+		damage(server);
+		return;
+	}
+	if (server->pin_wait_until && (int32_t)(server->pin_wait_until - now_ms()) > 0) {
+		hap(server, HAP_HEAVY, HG_SYSTEM);
+		return;
+	}
+	size_t n = strlen(server->pin_entry);
+	if ((k < 9 || k == 10) && n < (size_t)server->pin_len && n + 1 < sizeof(server->pin_entry)) {
+		server->pin_entry[n] = k == 10 ? '0' : (char)('1' + k);
+		server->pin_entry[n + 1] = 0;
+		server->pin_msg[0] = 0;
+		hap(server, HAP_KEY, HG_KEYS);
+		if ((int)strlen(server->pin_entry) == server->pin_len) {
+			pin_check(server);
+			if (!server->pin_open) return;	/* unlocked */
+		}
+	} else if (k == 11 && n) {
+		server->pin_entry[n - 1] = 0;
+		hap(server, HAP_KEY, HG_KEYS);
+	}
+	draw_pin(server);
+	damage(server);
+}
+
+static void lock(struct zt_server *server) {
+	/* with a PIN the lock is on, whatever the developer switch says */
+	if (server->width == 0 || (!server->lock_enabled && !server->pin_set)) {
+		return;
+	}
+	pin_reset(server);	/* the pad starts over from the swipe */
 	server->locked = true;
 	server->switcher = false;
 	server->switch_t = 0.0f;
@@ -10556,7 +10917,7 @@ static void screen_set(struct zt_server *server, bool on) {
 	} else {
 		const char *id = server->shown ? server->shown->xdg_toplevel->app_id : NULL;
 		/* an Android app under the lock screen (lock() below) is not in front */
-		bool locking = server->locked || (on && server->lock_enabled && server->width);
+		bool locking = server->locked || (on && (server->lock_enabled || server->pin_set) && server->width);
 		waydroid_power_request(demoloop || (waydroid_window(id) && !locking) ? "active" : "idle");
 		run_detached("ztos-waydroid-power", "sync", NULL, NULL);
 	}
@@ -11293,6 +11654,17 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 		} else p->role = ROLE_NONE;
 		return;
 	}
+	if (server->locked && server->pin_open) {
+		p->role = ROLE_PIN;
+		p->index = pin_hit(server, x, y);
+		if (p->index == 9) p->index = -1;	/* the blank key */
+		server->pin_pressed = p->index;
+		if (p->index >= 0) {
+			draw_pin(server);
+			damage(server);
+		}
+		return;
+	}
 	if (server->locked) {
 		p->role = ROLE_LOCK;	/* nothing under it can be reached */
 		p->index = -1;
@@ -11618,6 +11990,16 @@ static void touch_update(struct zt_server *server, int32_t id, double x, double 
 		}
 		damage(server);
 		break;
+	case ROLE_PIN:
+		/* off the key it went down on: that key is not pressed any more */
+		if (server->pin_pressed >= 0 && pin_hit(server, x, y) != server->pin_pressed) {
+			server->pin_pressed = -1;
+			if (server->pin_open) {
+				draw_pin(server);
+				damage(server);
+			}
+		}
+		break;
 	case ROLE_LOCK:
 		if (retro_on(server)) {
 			if (p->index == 1 && server->locked) {
@@ -11811,6 +12193,31 @@ static void touch_update(struct zt_server *server, int32_t id, double x, double 
 	}
 }
 
+/* The lock lets go: the swipe without a PIN, or the right PIN. */
+static void unlock_now(struct zt_server *server) {
+	server->locked = false;
+	if (!server->boot_logo_done) {
+		char marker[256];
+		if (access(runtime_file(marker, sizeof(marker), "ztmetro-logo-unlocked"), F_OK) == 0) server->boot_logo_done = true;
+		else if (!retro_on(server)) boot_logo_prepare(server);	/* (DotMatrix: its home's own) */
+	}
+	hap(server, HAP_TAP, HG_SLIDE);
+	ui_sound(server, UIS_UNLOCK);
+	animate(server, &server->lock_y, (float)-server->height, 200, 0, false);
+	if (retro_on(server) && server->shown) {
+		/* the app that was open lights up again, dot by dot */
+		server->app_angle = TURN_IN_DEG;
+		animate(server, &server->app_angle, 0.0f, 450, 0, false);
+	}
+	const char *shown_id = server->shown ? server->shown->xdg_toplevel->app_id : NULL;
+	if (waydroid_window(shown_id)) {
+		/* the Android app that was open is in front again */
+		waydroid_power_request("active");
+		run_detached("ztos-waydroid-power", "sync", NULL, NULL);
+	}
+	wlr_log(WLR_INFO, "unlocked");
+}
+
 static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool cancelled) {
 	struct touch_point *p = touch_find(server, id, false);
 	if (!p) {
@@ -11886,6 +12293,26 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
 			}
 		}
 		break;
+	case ROLE_PIN: {
+		int was = server->pin_pressed;
+		server->pin_pressed = -1;
+		if (!server->pin_open) break;
+		struct pin_geo g;
+		pin_geometry(server, &g);
+		if (!cancelled && p->index >= 0 && was == p->index) {
+			pin_key(server, p->index);
+		} else if (!cancelled && p->y0 < g.top && p->y - p->y0 > server->height / 6.0) {
+			/* pulled down by the photo: back to the lock screen */
+			hap(server, HAP_TAP, HG_SLIDE);
+			pin_reset(server);
+			draw_lock(server);
+			damage(server);
+		} else {
+			draw_pin(server);
+			damage(server);
+		}
+		break;
+	}
 	case ROLE_LOCK:
 		if (!server->locked) {
 			break;
@@ -11902,27 +12329,14 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
 			}
 		}
 		if (dm_swiped || (!retro_on(server) && !cancelled && p->y - p->y0 < -server->height / 5.0)) {
-			server->locked = false;
-			if (!server->boot_logo_done) {
-				char marker[256];
-				if (access(runtime_file(marker, sizeof(marker), "ztmetro-logo-unlocked"), F_OK) == 0) server->boot_logo_done = true;
-				else if (!retro_on(server)) boot_logo_prepare(server);	/* (DotMatrix: its home's own) */
+			if (server->pin_set) {
+				/* a PIN: the pad, not Start */
+				if (retro_on(server)) dm_launcher_unlock_drag(server->dm, 0);
+				hap(server, HAP_TAP, HG_SLIDE);
+				pin_open_pad(server);
+			} else {
+				unlock_now(server);
 			}
-			hap(server, HAP_TAP, HG_SLIDE);
-			ui_sound(server, UIS_UNLOCK);
-			animate(server, &server->lock_y, (float)-server->height, 200, 0, false);
-			if (retro_on(server) && server->shown) {
-				/* the app that was open lights up again, dot by dot */
-				server->app_angle = TURN_IN_DEG;
-				animate(server, &server->app_angle, 0.0f, 450, 0, false);
-			}
-			const char *shown_id = server->shown ? server->shown->xdg_toplevel->app_id : NULL;
-			if (waydroid_window(shown_id)) {
-				/* the Android app that was open is in front again */
-				waydroid_power_request("active");
-				run_detached("ztos-waydroid-power", "sync", NULL, NULL);
-			}
-			wlr_log(WLR_INFO, "unlocked");
 		} else if (!p->moved) {
 			/* a tap: it lifts a little and drops, to show which way it goes */
 			server->lock_y = -26.0f;
@@ -12268,6 +12682,10 @@ static void ctl_command(struct zt_server *server, char *line) {
 				break;
 			}
 		}
+	} else if (!strcmp(line, "lockpad")) {
+		/* the PIN pad, as the unlock swipe brings it (for testing): only
+		 * over a lock that has a PIN, so it unlocks nothing by itself */
+		if (server->locked && server->pin_set && !server->pin_open) pin_open_pad(server);
 	} else if (!strcmp(line, "call_screen")) {
 		server->call_over_lock = true;
 		draw_status(server);
@@ -13491,7 +13909,7 @@ static void render_frame(struct zt_server *server) {
 	 * resting lock screen were 4.5 screens a frame. */
 	/* (the DotMatrix style's lock is a screen of its home, not this picture) */
 	bool lock_shown = server->lock_layer.tex && (server->locked || server->lock_y > 1.0f - server->height) &&
-		!retro_on(server);
+		(!retro_on(server) || server->pin_layer);
 	float under = lock_shown ? server->lock_y + server->height : 0.0f;	/* the first row it leaves */
 	bool lock_covers = lock_shown && under >= server->height - 0.5f;
 	int under_top = lock_shown && under > 0.5f ? (int)floorf(under * server->scale) : 0;
@@ -13935,19 +14353,22 @@ static void render_frame(struct zt_server *server) {
 	if (server->keypop && server->osk_visible && server->keypop_layer.tex) {
 		layer_draw(server, &server->keypop_layer, server->keypop_x, server->keypop_y, 1.0f);
 	}
-	if (server->lock_layer.tex && (server->locked || server->lock_y > 1.0f - server->height) && !retro_on(server)) {
+	if (server->lock_layer.tex && (server->locked || server->lock_y > 1.0f - server->height) &&
+			(!retro_on(server) || server->pin_layer)) {
 		layer_draw(server, &server->lock_layer, 0, server->lock_y, 1.0f);
 		/* the clock block rises by LOCK_LIFT as the notification row comes in */
 		float lift = server->lock_lift < 0.0f ? 0.0f : server->lock_lift > 1.0f ? 1.0f : server->lock_lift;
-		if (server->lock_clock_layer.tex) {
+		if (server->pin_layer) {
+			/* the PIN pad: no clock, notifications or charging plug over it */
+		} else if (server->lock_clock_layer.tex) {
 			layer_draw(server, &server->lock_clock_layer, 0,
 				server->lock_y + (float)LOCK_CLOCK_Y(server) - LOCK_LIFT * lift, 1.0f);
 		}
-		if (server->lock_note_layer.tex && lift > 0.0f) {
+		if (server->lock_note_layer.tex && lift > 0.0f && !server->pin_layer) {
 			layer_draw(server, &server->lock_note_layer, 0,
 				server->lock_y + (float)LOCK_NOTE_Y(server) + LOCK_LIFT * (1.0f - lift), lift);
 		}
-		plug_over(server, server->lock_y);
+		if (!server->pin_layer) plug_over(server, server->lock_y);
 	}
 	if (server->call_over_lock && server->shown && server->shown->mapped &&
 			server->shown->xdg_toplevel->app_id &&
@@ -14366,6 +14787,12 @@ static int reload(int signal_number, void *data) {
 	int strength = server->haptic_strength;
 	int ring_before = server->ring_volume;
 	load_config(server);
+	if (server->pin_open && !server->pin_set) {
+		/* the PIN was removed while its pad was up: back to the swipe */
+		pin_reset(server);
+		draw_lock(server);
+		damage(server);
+	}
 	if (server->style_config != server->style) {
 		/* the settings app chose the other style: the session starts again */
 		style_switch(server, server->style_config);
@@ -14771,6 +15198,8 @@ int main(int argc, char *argv[]) {
 	wl_event_loop_add_signal(server.loop, SIGHUP, reload, &server);
 	server.launch_timer = wl_event_loop_add_timer(server.loop, launch_timed_out, &server);
 	server.volume_timer = wl_event_loop_add_timer(server.loop, volume_hide, &server);
+	server.pin_timer = wl_event_loop_add_timer(server.loop, pin_tick, &server);
+	server.pin_pressed = -1;
 	server.shot_timer = wl_event_loop_add_timer(server.loop, power_alone, &server);
 	server.shot_note_timer = wl_event_loop_add_timer(server.loop, screenshot_noted, &server);
 	server.shot_grab_timer = wl_event_loop_add_timer(server.loop, screenshot_grab, &server);

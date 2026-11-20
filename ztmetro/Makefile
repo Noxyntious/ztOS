@@ -39,7 +39,7 @@ DM_WRAP_LDFLAGS = -Wl,--wrap=cairo_fill,--wrap=cairo_fill_preserve,--wrap=cairo_
 
 ztmetro: ztmetro.c auth/prompt.c xdg-shell-protocol.h $(RETRO_DEPS) $(DM_WRAP)
 	$(CC) $(CFLAGS) $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) $(IAL_FLAGS) \
-		-o $@ ztmetro.c $(RETRO) $(DM_WRAP) $(DM_WRAP_LDFLAGS) $(shell pkg-config --libs $(PKGS)) $(IAL_LIBS) -lm -lpthread
+		-o $@ ztmetro.c $(RETRO) $(DM_WRAP) $(DM_WRAP_LDFLAGS) $(shell pkg-config --libs $(PKGS)) $(IAL_LIBS) -lm -lpthread -lcrypt
 
 # the DotMatrix screens rendered offscreen to PNG files, to check them without a phone
 retro/dm-test: retro/dm-test.c $(RETRO_DEPS)
@@ -68,7 +68,7 @@ camera/ztcamera: camera/ztcamera.c camera/raw-source.h camera/camss-source.h $(C
 	$(APP_BUILD) -o $@ camera/ztcamera.c $(CORE) $(APP_LIBS)
 
 settings/ztsettings: settings/ztsettings.c settings/boostpage.h $(CORE_DEPS)
-	$(APP_BUILD) -o $@ settings/ztsettings.c $(CORE) $(APP_LIBS)
+	$(APP_BUILD) -o $@ settings/ztsettings.c $(CORE) $(APP_LIBS) -lcrypt
 
 devtest/zrndevtest: devtest/zrndevtest.c $(CORE_DEPS)
 	$(APP_BUILD) -o $@ devtest/zrndevtest.c $(CORE) $(APP_LIBS)
