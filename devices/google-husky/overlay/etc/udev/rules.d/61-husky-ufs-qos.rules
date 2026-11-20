@@ -1,0 +1,5 @@
+# ufshcd votes a 0 us CPU latency QoS whenever its clocks are on (no clock
+# scaling/gating on the Exynos UFS here, so: always). That forbids every
+# cpuidle state but WFI -> no core ever reaches C2, the SoC runs hot.
+# Drop the vote: storage latency is fine without it.
+ACTION=="add|change", SUBSYSTEM=="platform", KERNEL=="13200000.ufs", ATTR{pm_qos_enable}="0"
