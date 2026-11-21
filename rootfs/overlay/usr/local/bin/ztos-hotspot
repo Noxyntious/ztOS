@@ -1,0 +1,85 @@
+#!/bin/sh
+# ztos-hotspot: internet sharing (a Wi-Fi hotspot) through NetworkManager.
+#
+#   ztos-hotspot status          state, name and password, as key=value lines
+#   ztos-hotspot on | off        share the phone's connection, or stop
+#   ztos-hotspot set NAME PASS   the network's name and its WPA2 password
+#
+# One NetworkManager connection, "ztOS hotspot": an access point with
+# ipv4.method shared (NetworkManager runs dnsmasq for DHCP/DNS and masquerades
+# through whichever connection has the default route -- mobile data, usually).
+# It is made the first time it is needed, with a name from this phone's
+# machine-id and a random password, so nothing is device-specific: any Wi-Fi
+# driver NetworkManager can put in AP mode works. ztmetro's quick action and
+# ztsettings' "internet sharing" page both go through this script; the
+# dispatcher hook (90-ztos-hotspot) keeps /run/ztos-hotspot.on in step so the
+# shell can show the state without asking NetworkManager.
+set -u
+
+CON="ztOS hotspot"
+
+say() { printf '%s\n' "$*"; }
+die() { printf 'ztos-hotspot: %s\n' "$*" >&2; exit 1; }
+
+exists() { nmcli -t -f NAME connection show 2>/dev/null | grep -qxF "$CON"; }
+active() { nmcli -t -f NAME connection show --active 2>/dev/null | grep -qxF "$CON"; }
+
+default_name() {
+	id=$(cut -c1-4 /etc/machine-id 2>/dev/null)
+	say "ztOS-${id:-hotspot}"
+}
+
+random_password() {
+	# ten letters and digits, without the ones that are easy to misread
+	tr -dc 'abcdefghjkmnpqrstuvwxyz23456789' </dev/urandom 2>/dev/null | head -c 10
+}
+
+valid() {
+	name=$1 pass=$2
+	[ -n "$name" ] && [ ${#name} -le 32 ] || die "the name must be 1 to 32 characters"
+	[ ${#pass} -ge 8 ] && [ ${#pass} -le 63 ] || die "the password must be 8 to 63 characters"
+}
+
+create() {
+	name=${1:-$(default_name)} pass=${2:-$(random_password)}
+	valid "$name" "$pass"
+	nmcli connection add type wifi ifname '*' con-name "$CON" autoconnect no ssid "$name" \
+		802-11-wireless.mode ap 802-11-wireless.band bg \
+		ipv4.method shared ipv6.method ignore \
+		wifi-sec.key-mgmt wpa-psk wifi-sec.proto rsn wifi-sec.pairwise ccmp \
+		wifi-sec.group ccmp wifi-sec.psk "$pass" >/dev/null || die "could not create the connection"
+}
+
+ensure() { exists || create; }
+
+case "${1:-status}" in
+status)
+	ensure
+	if active; then say "state=on"; else say "state=off"; fi
+	say "name=$(nmcli -g 802-11-wireless.ssid connection show "$CON" 2>/dev/null)"
+	say "password=$(nmcli -s -g 802-11-wireless-security.psk connection show "$CON" 2>/dev/null)"
+	;;
+on)
+	ensure
+	nmcli radio wifi on >/dev/null 2>&1
+	nmcli connection up "$CON" >/dev/null || die "the Wi-Fi did not start sharing (does its driver do AP mode?)"
+	;;
+off)
+	if active; then nmcli connection down "$CON" >/dev/null || die "could not stop sharing"; fi
+	;;
+set)
+	[ $# -eq 3 ] || die "usage: ztos-hotspot set NAME PASSWORD"
+	valid "$2" "$3"
+	if exists; then
+		nmcli connection modify "$CON" 802-11-wireless.ssid "$2" wifi-sec.psk "$3" ||
+			die "could not change the connection"
+		# a running hotspot takes the new name and password at once
+		if active; then nmcli connection up "$CON" >/dev/null; fi
+	else
+		create "$2" "$3"
+	fi
+	;;
+*)
+	die "usage: ztos-hotspot status | on | off | set NAME PASSWORD"
+	;;
+esac

@@ -81,6 +81,7 @@ enum page {
 	PAGE_WALLS,	/* the background photo picker: categories, then one */
 	PAGE_NAVIGATION,
 	PAGE_BOOST,	/* Dynamic Boost System: RapidBoost and IntelligentBoost */
+	PAGE_SHARING,	/* internet sharing: a Wi-Fi hotspot (ztos-hotspot) */
 };
 
 enum action {
@@ -165,6 +166,9 @@ enum action {
 	ACT_ABOUT_REPO,
 	ACT_IB_MODE,		/* arg: 0 off, 1 shadow, 2 on */
 	ACT_IB_ENGINE,		/* arg: 0 the processor, 1 SCORE */
+	ACT_SHARING_SWITCH,
+	ACT_SHARING_FIELD,	/* arg: 0 the name, 1 the password */
+	ACT_SHARING_SAVE,
 	ACT_QUICK_SLOT,		/* then one for each of the eight places */
 	ACT_QUICK_LAST = ACT_QUICK_SLOT + 7,
 };
@@ -183,10 +187,13 @@ static const struct { const char *key, *title, *about; } HAPTIC_GROUPS[] = {
 
 /* The quick actions there are, as the shell names them in `quick`. */
 static const char *const QUICK_IDS[] = { "wifi", "data", "bluetooth", "airplane", "rotation",
-	"flashlight", "location", "brightness", "settings", "vibrate", "none" };
+	"flashlight", "location", "brightness", "settings", "vibrate", "hotspot", "none" };
 static const char *const QUICK_NAMES[] = { "Wi-Fi", "Mobile data", "Bluetooth", "Airplane mode",
-	"Rotation lock", "Flashlight", "Location", "Brightness", "All settings", "Vibration", "(empty)" };
-#define N_QUICK 11
+	"Rotation lock", "Flashlight", "Location", "Brightness", "All settings", "Vibration",
+	"Internet sharing", "(empty)" };
+#define N_QUICK 12
+
+static bool sharing_now(void);	/* internet sharing: is it on? */
 
 struct network {
 	char ssid[64];
@@ -884,6 +891,7 @@ static double draw_main(cairo_t *cr) {
 
 	wifi_summary(wifi, sizeof(wifi));
 	y = zmc_entry(cr, y, "Wi-Fi", wifi, ACT_OPEN_PAGE, PAGE_WIFI);
+	y = zmc_entry(cr, y, "internet sharing", sharing_now() ? "on" : "off", ACT_OPEN_PAGE, PAGE_SHARING);
 
 	bt_summary(detail, sizeof(detail));
 	y = zmc_entry(cr, y, "Bluetooth", detail, ACT_OPEN_PAGE, PAGE_BLUETOOTH);
@@ -2268,6 +2276,106 @@ static double draw_apn(cairo_t *cr) {
 	return y + 20;
 }
 
+/* Internet sharing: the phone's connection shared as a Wi-Fi hotspot, through
+ * NetworkManager's shared access point. ztos-hotspot does the work and answers
+ * `status` with key=value lines; its dispatcher hook keeps /run/ztos-hotspot.on,
+ * which the hub and the shell's quick action read. */
+static struct {
+	bool known, on, loading;
+	char name[33], pass[64];
+	char note[96];
+	int focus;		/* the box being typed in, or -1 */
+} share = { .focus = -1 };
+static FILE *share_pipe;
+static char share_buf[1024];
+static size_t share_len;
+
+static bool sharing_now(void) {
+	return access("/run/ztos-hotspot.on", F_OK) == 0;
+}
+
+static void share_parse(char *text) {
+	char *save = NULL;
+	for (char *line = strtok_r(text, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+		if (strncmp(line, "state=", 6) == 0) {
+			share.on = strcmp(line + 6, "on") == 0;
+			share.known = true;
+		} else if (strncmp(line, "name=", 5) == 0 && share.focus != 0) {
+			snprintf(share.name, sizeof(share.name), "%s", line + 5);
+		} else if (strncmp(line, "password=", 9) == 0 && share.focus != 1) {
+			snprintf(share.pass, sizeof(share.pass), "%s", line + 9);
+		} else if (strncmp(line, "ztos-hotspot: ", 14) == 0) {
+			snprintf(share.note, sizeof(share.note), "%s", line + 14);	/* what went wrong */
+		}
+	}
+}
+
+static void share_ready(int fd, void *data) {
+	(void)data;
+	ssize_t n = read(fd, share_buf + share_len, sizeof(share_buf) - 1 - share_len);
+	if (n > 0) {
+		share_len += (size_t)n;
+		if (share_len < sizeof(share_buf) - 1) return;	/* more to come */
+	}
+	zmc_watch_fd(fd, NULL, NULL);
+	pclose(share_pipe);
+	share_pipe = NULL;
+	share_buf[share_len] = 0;
+	share.loading = false;
+	share_parse(share_buf);
+	zmc_busy(false);
+	zmc_redraw();
+}
+
+/* `ztos-hotspot ARGS` (ARGS already quoted, or NULL), then its state. */
+static void share_run(const char *args) {
+	if (share_pipe) return;	/* an answer is already on its way */
+	char command[512];
+	snprintf(command, sizeof(command), "%s%s%sztos-hotspot status 2>&1",
+		args ? "ztos-hotspot " : "", args ? args : "", args ? " 2>&1; " : "");
+	share_pipe = popen(command, "r");
+	if (!share_pipe) return;
+	share_len = 0;
+	share.loading = true;
+	zmc_watch_fd(fileno(share_pipe), share_ready, NULL);
+	zmc_busy(true);
+}
+
+static void share_save(void) {
+	size_t name = strlen(share.name), pass = strlen(share.pass);
+	if (!name || name > 32) {
+		snprintf(share.note, sizeof(share.note), "the name must be 1 to 32 characters");
+		return;
+	}
+	if (pass < 8 || pass > 63) {
+		snprintf(share.note, sizeof(share.note), "the password must be 8 to 63 characters");
+		return;
+	}
+	char qname[80], qpass[140], args[240];
+	shell_quote(qname, sizeof(qname), share.name);
+	shell_quote(qpass, sizeof(qpass), share.pass);
+	snprintf(args, sizeof(args), "set %s %s", qname, qpass);
+	snprintf(share.note, sizeof(share.note), "saved");
+	share_run(args);
+}
+
+static double draw_sharing(cairo_t *cr) {
+	double y = zmc_header(cr, "internet sharing");
+	y = zmc_switch(cr, y, "Sharing", share.on, ACT_SHARING_SWITCH);
+	y = zmc_field(cr, y, "Status", share.loading ? "Working on it\u2026" :
+		!share.known ? "NetworkManager has not answered" :
+		share.on ? "On: devices join with the name and password below" : "Off");
+	y = zmc_textbox(cr, y, "Broadcast name", share.name, share.focus == 0, ACT_SHARING_FIELD, 0);
+	y = zmc_textbox(cr, y, "Password", share.pass, share.focus == 1, ACT_SHARING_FIELD, 1);
+	y = zmc_entry(cr, y, "save", share.note[0] ? share.note : "the name and password other devices join with",
+		ACT_SHARING_SAVE, 0);
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	y += zmc_text(cr, "Shares this phone's mobile data over Wi-Fi. While sharing is on, the phone "
+		"itself is not connected to a Wi-Fi network.", FONT_REGULAR, 13.5, MARGIN, y,
+		zmc.width - 2 * MARGIN) + 20;
+	return y;
+}
+
 /* A key of the keyboard, for the box that has it. */
 static void wifi_join(void);
 static void wifi_net_set(const char *ssid);
@@ -2383,6 +2491,21 @@ static double draw_date(cairo_t *cr) {
 }
 
 static void typed(const char *text) {
+	if (zmc.page == PAGE_SHARING && share.focus >= 0) {
+		char *field = share.focus == 0 ? share.name : share.pass;
+		size_t len = strlen(field), max = share.focus == 0 ? 32 : 63;
+		share.note[0] = 0;
+		if (text[0] == '\b') {
+			if (len) field[len - 1] = 0;
+		} else if (text[0] == '\n') {
+			share.focus = share.focus == 0 ? 1 : -1;	/* on to the password */
+			if (share.focus < 0) zmc_keyboard(false);
+		} else if (len < max && text[0] >= ' ' && text[0] < 127) {
+			field[len] = text[0];
+			field[len + 1] = 0;
+		}
+		return;
+	}
     if (zmc.page == PAGE_DATE && date_focus >= 0 && !date_pipe) {
         char *field = date_fields[date_focus]; size_t len = strlen(field);
         if (text[0] == '\b') { if (len) field[len-1] = 0; }
@@ -2989,6 +3112,7 @@ static double render_page_content(cairo_t *cr, int p) {
 	case PAGE_HAPTICS: return draw_haptics(cr);
 	case PAGE_QUICK: return draw_quick(cr);
 	case PAGE_APN: return draw_apn(cr);
+	case PAGE_SHARING: return draw_sharing(cr);
 	case PAGE_WIFI_JOIN: return draw_wifi_join(cr);
 	case PAGE_WIFI_NET: return draw_wifi_net(cr);
 	}
@@ -3045,6 +3169,22 @@ static void activate(int action, int arg) {
 		break;
 	case ACT_NAV_ICON:
 		if (arg >= 0 && arg <= 4) { app.nav_icon_idx = arg; config_save(); }
+		break;
+	case ACT_SHARING_SWITCH:
+		share.focus = -1;
+		zmc_keyboard(false);
+		share.note[0] = 0;
+		share.on = !share.on;	/* at once; the answer corrects it */
+		share_run(share.on ? "on" : "off");
+		break;
+	case ACT_SHARING_FIELD:
+		share.focus = arg;
+		zmc_keyboard(true);
+		break;
+	case ACT_SHARING_SAVE:
+		share.focus = -1;
+		zmc_keyboard(false);
+		share_save();
 		break;
 	case ACT_APN_FIELD:
 		apn_focus = arg;
@@ -3808,6 +3948,10 @@ static bool back(void) {
 		return true;
 	}
 	if (zmc.page == PAGE_DATE) { date_focus = -1; zmc_keyboard(false); }
+	if (zmc.page == PAGE_SHARING) {
+		share.focus = -1;
+		zmc_keyboard(false);
+	}
 	if (zmc.page == PAGE_APN) {
 		apn_focus = -1;
 		zmc_keyboard(false);
@@ -3839,6 +3983,11 @@ static void arrived(int page) {
 		zmc_every(15000, bt_tick);
 	} else if (page == PAGE_MAIN) {
 		bt_refresh(NULL);	/* the hub's line says whether it is on */
+	}
+	if (page == PAGE_SHARING) {
+		share.focus = -1;
+		share.note[0] = 0;
+		share_run(NULL);
 	}
 	if (page == PAGE_WIFI) {
 		wifi_refresh(NULL);
@@ -3883,7 +4032,7 @@ static const struct { const char *name; enum page page; } pages[] = {
 	{ "wifi", PAGE_WIFI }, { "bluetooth", PAGE_BLUETOOTH }, { "mobile", PAGE_MOBILE }, { "audio", PAGE_AUDIO },
 	{ "battery", PAGE_BATTERY }, { "cpu", PAGE_CPU }, { "vm", PAGE_VM },
 	{ "gpu", PAGE_GPU }, { "keyboard", PAGE_KEYBOARD }, { "about", PAGE_ABOUT },
-	{ "perf", PAGE_PERF }, { "boost", PAGE_BOOST }, { "dev", PAGE_DEV }, { "haptics", PAGE_HAPTICS }, { "quick", PAGE_QUICK }, { "apn", PAGE_APN }, { "wifijoin", PAGE_WIFI_JOIN }, { "wifinet", PAGE_WIFI_NET },
+	{ "perf", PAGE_PERF }, { "boost", PAGE_BOOST }, { "dev", PAGE_DEV }, { "haptics", PAGE_HAPTICS }, { "quick", PAGE_QUICK }, { "apn", PAGE_APN }, { "sharing", PAGE_SHARING }, { "wifijoin", PAGE_WIFI_JOIN }, { "wifinet", PAGE_WIFI_NET },
 };
 
 static int page_named(const char *name) {

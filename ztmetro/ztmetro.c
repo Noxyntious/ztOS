@@ -723,6 +723,7 @@ struct zt_server {
 	char bt_name[64];
 	int bt_battery;			/* percent, -1 unknown */
 	bool shade_torch;
+	bool shade_hotspot;	/* sharing the connection over Wi-Fi (ztos-hotspot) */
 	bool shade_rotation;
 	bool shade_airplane;
 	bool shade_location;
@@ -2151,6 +2152,20 @@ static void draw_icon_vector(cairo_t *cr, const char *name, double cx, double cy
 		cairo_line_to(cr, u * 0.4, -u * 0.42);
 		cairo_line_to(cr, -u * 0.45, u * 0.42);
 		cairo_stroke(cr);
+	} else if (strcmp(name, "hotspot") == 0) {
+		/* internet sharing: a point that sends out waves either side */
+		cairo_arc(cr, 0, 0, u * 0.17, 0, 2 * M_PI);
+		cairo_fill(cr);
+		cairo_set_line_width(cr, fmax(1.3, s * 0.08));
+		cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+		for (int ring = 1; ring <= 2; ring++) {
+			double r = u * (0.18 + 0.32 * ring);
+			cairo_new_sub_path(cr);
+			cairo_arc(cr, 0, 0, r, -M_PI * 0.27, M_PI * 0.27);
+			cairo_new_sub_path(cr);
+			cairo_arc(cr, 0, 0, r, M_PI * 0.73, M_PI * 1.27);
+		}
+		cairo_stroke(cr);
 	} else if (strcmp(name, "airplane") == 0) {
 		/* seen from above, nose to the right */
 		cairo_move_to(cr, u * 0.95, 0);
@@ -2449,14 +2464,15 @@ static char *trim(char *s) {
  * actions puts one in each of the eight places; `quick` in the config). */
 enum quick {
 	Q_WIFI, Q_DATA, Q_BLUETOOTH, Q_AIRPLANE, Q_ROTATION, Q_FLASHLIGHT, Q_LOCATION,
-	Q_BRIGHTNESS, Q_SETTINGS, Q_VIBRATE, Q_NONE, Q_COUNT,
+	Q_BRIGHTNESS, Q_SETTINGS, Q_VIBRATE, Q_HOTSPOT, Q_NONE, Q_COUNT,
 };
 static const struct { const char *id, *icon, *label; } QUICK[Q_COUNT] = {
 	{ "wifi", "wifi", "WI-FI" }, { "data", "", "MOBILE DATA" },
 	{ "bluetooth", "bluetooth", "BLUETOOTH" }, { "airplane", "airplane", "AIRPLANE MODE" },
 	{ "rotation", "rotation", "ROTATION LOCK" }, { "flashlight", "flashlight", "FLASHLIGHT" },
 	{ "location", "location", "LOCATION" }, { "brightness", "brightness", "BRIGHTNESS" },
-	{ "settings", "gear", "ALL SETTINGS" }, { "vibrate", "", "VIBRATION" }, { "none", "", "" },
+	{ "settings", "gear", "ALL SETTINGS" }, { "vibrate", "", "VIBRATION" },
+	{ "hotspot", "hotspot", "INTERNET SHARING" }, { "none", "", "" },
 };
 static const int QUICK_DEFAULT[8] = {
 	Q_WIFI, Q_DATA, Q_BLUETOOTH, Q_AIRPLANE, Q_ROTATION, Q_FLASHLIGHT, Q_BRIGHTNESS, Q_SETTINGS,
@@ -6308,6 +6324,7 @@ static void shade_tile_draw(struct zt_server *server, cairo_t *cr, int i, double
 	bool on = q == Q_WIFI ? server->shade_wifi : q == Q_AIRPLANE ? server->shade_airplane :
 		q == Q_DATA ? server->cell_data_on : q == Q_VIBRATE ? server->haptics_enabled :
 		q == Q_FLASHLIGHT ? server->shade_torch : q == Q_BLUETOOTH ? server->shade_bt :
+		q == Q_HOTSPOT ? server->shade_hotspot :
 		q == Q_BRIGHTNESS;
 	/* on: the accent colour; off: a dark grey block */
 	if (on) {
@@ -7976,6 +7993,15 @@ static void shade_activate(struct zt_server *server, int index) {
 		hap(server, HAP_TAP, HG_SYSTEM);
 		server->shade_bt = !server->shade_bt;
 		run_detached("bluetoothctl", "power", server->shade_bt ? "on" : "off", NULL);
+		draw_shade(server);
+		damage(server);
+		break;
+	case 100 + Q_HOTSPOT:
+		/* internet sharing: NetworkManager's shared access point, through
+		 * ztos-hotspot; its dispatcher hook says when it is really up */
+		hap(server, HAP_TAP, HG_SYSTEM);
+		server->shade_hotspot = !server->shade_hotspot;
+		run_detached("ztos-hotspot", server->shade_hotspot ? "on" : "off", NULL, NULL);
 		draw_shade(server);
 		damage(server);
 		break;
@@ -10564,6 +10590,7 @@ static void retro_media(void *data, int cmd) {
 static bool retro_radio(void *data, const char *id) {
 	struct zt_server *server = data;
 	server->shade_wifi = wifi_up();
+	server->shade_hotspot = access("/run/ztos-hotspot.on", F_OK) == 0;
 	server->shade_bt = server->bt_on;
 	if (!strcmp(id, "wifi")) {
 		shade_activate(server, 100 + Q_WIFI);
@@ -11165,6 +11192,7 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 		}
 		p->down_ms = now_ms();
 		server->shade_wifi = wifi_up();
+		server->shade_hotspot = access("/run/ztos-hotspot.on", F_OK) == 0;
 		modem_read(server);
 		server->shade_airplane = server->cell_airplane;
 		draw_shade(server);
@@ -14325,6 +14353,7 @@ static int render_to_files(struct zt_server *server, const char *dir) {
 	draw_sensorhub_fail(server);
 	g_dump_name = "shade";
 	server->shade_wifi = wifi_up();
+	server->shade_hotspot = access("/run/ztos-hotspot.on", F_OK) == 0;
 	draw_shade(server);
     g_dump_name = "authentication";
     server->auth_active = true;

@@ -1,0 +1,10 @@
+#!/bin/sh
+# Keep /run/ztos-hotspot.on in step with the "ztOS hotspot" connection, so that
+# ztmetro's quick action and ztsettings can show whether the phone is sharing
+# its connection without asking NetworkManager (see ztos-hotspot).
+[ "${CONNECTION_ID:-}" = "ztOS hotspot" ] || exit 0
+case "$2" in
+up) : > /run/ztos-hotspot.on ;;
+down|pre-down) rm -f /run/ztos-hotspot.on ;;
+esac
+exit 0
